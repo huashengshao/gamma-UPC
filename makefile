@@ -12,7 +12,7 @@ FC=gfortran
 
 EXE=test
 
-photonflux=tbessk.o tbessj.o elliptic_integral.o nielsen_generalized_polylog.o photoabsorption.o ElasticPhotonPhotonFlux.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o
+photonflux=tbessk.o tbessj.o elliptic_integral.o nielsen_generalized_polylog.o photoabsorption.o ElasticFlux.o PhotonPhotonFlux.o ElasticPhotonPhotonFlux.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o
 
 all: $(LIBDIR)$(LIBRARY)
 
@@ -25,7 +25,13 @@ $(EXE): test.o $(photonflux)
 test.o: test.f90 ElasticPhotonPhotonFlux.mod OpticalGlauber_Geometry.mod
 	$(FC) $(FFLAGS) -c $<
 
-ElasticPhotonPhotonFlux.o ElasticPhotonPhotonFlux.mod: ElasticPhotonPhotonFlux.f90 OpticalGlauber_Geometry.mod nintlib.mod interpolation.mod fmin_module.mod photoabsorption.mod
+ElasticPhotonPhotonFlux.o ElasticPhotonPhotonFlux.mod: ElasticPhotonPhotonFlux.f90 PhotonPhotonFlux.mod
+	$(FC) $(FFLAGS) -c $<
+
+PhotonPhotonFlux.o PhotonPhotonFlux.mod: PhotonPhotonFlux.f90 ElasticFlux.mod OpticalGlauber_Geometry.mod nintlib.mod interpolation.mod fmin_module.mod photoabsorption.mod
+	$(FC) $(FFLAGS) -c $<
+
+ElasticFlux.o ElasticFlux.mod: ElasticFlux.f90 OpticalGlauber_Geometry.mod nintlib.mod interpolation.mod fmin_module.mod
 	$(FC) $(FFLAGS) -c $<
 
 photoabsorption.o photoabsorption.mod: photoabsorption.f90
