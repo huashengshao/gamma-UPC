@@ -94,6 +94,8 @@ PROGRAM bench_blocks
      DO j=1,15
         b=bR(j)*rr/0.1973d0
         IF(icoll.EQ.2)b=bR(j)*0.877d0/0.1973d0
+        ! on the nearest node of the engine's ln b grid: the density itself, not its interpolation
+        b=FFE_Test_Value(6,icoll,xs(i),b)
         v=FFE_Test_Value(3,icoll,xs(i),b)
         sep=MERGE(',',' ',.NOT.(i.EQ.9.AND.j.EQ.15))
         WRITE(iu,'(A,ES26.17E3,A,ES26.17E3,A,ES26.17E3,A)')'  [',xs(i),', ',b,', ',v,']'//sep

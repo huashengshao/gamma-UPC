@@ -11220,6 +11220,42 @@ CONTAINS
           IF(DABS(br(i)-tj(k)).LT.1d-12)lsing=.TRUE.
           IF(DABS(br(i+1)-tj(k)).LT.1d-12)rsing=.TRUE.
        ENDDO
+       IF((lsing.OR.rsing).AND.len.GT.2d0*ht)THEN
+          ! a long panel at a jump line: u^2 substitution on the sub-panel of length ht next to
+          ! each singular end (8 nodes), regular panels on the rest (the far side of a jump line
+          ! is smooth, and the integrand varies with W1 W2 on the scale of the whole panel)
+          ta=br(i)
+          tb=br(i+1)
+          IF(lsing)THEN
+             DO g=1,8
+                u=0.5d0*(1d0+x8(g))
+                nt=nt+1
+                tt(nt)=ta+ht*u*u
+                wt(nt)=0.5d0*w8(g)*2d0*ht*u
+             ENDDO
+             ta=ta+ht
+          ENDIF
+          IF(rsing)THEN
+             DO g=1,8
+                u=0.5d0*(1d0+x8(g))
+                nt=nt+1
+                tt(nt)=tb-ht*u*u
+                wt(nt)=0.5d0*w8(g)*2d0*ht*u
+             ENDDO
+             tb=tb-ht
+          ENDIF
+          ns=MAX(1,CEILING((tb-ta)/ht-1d-9))
+          h=(tb-ta)/DBLE(ns)
+          DO j=1,ns
+             a=ta+(DBLE(j)-0.5d0)*h
+             DO g=1,8
+                nt=nt+1
+                tt(nt)=a+0.5d0*h*x8(g)
+                wt(nt)=0.5d0*h*w8(g)
+             ENDDO
+          ENDDO
+          CYCLE
+       ENDIF
        IF(lsing.OR.rsing)THEN
           ! u^2 substitution towards the singular end(s), 16 nodes
           CALL ffe_gauleg(8,x8,w8)
@@ -12226,6 +12262,7 @@ CONTAINS
     !         3: N(x,b) of engine beam 1 (unit charge, alpha = 1), b in GeV^-1
     !         4: N(x,b) of engine beam 2
     !         5: P_tag(b), b in GeV^-1
+    !         6: the node of the ln b grid of engine beam 1 nearest to b (GeV^-1)
     IMPLICIT NONE
     REAL(KIND(1d0))::FFE_Test_Value
     INTEGER,INTENT(IN)::what,icoll
@@ -12262,6 +12299,9 @@ CONTAINS
        DEALLOCATE(Wr)
     CASE(5)
        FFE_Test_Value=ffe_Ptag(b)
+    CASE(6)
+       i0=MINLOC(DABS(DLOG(ffe_vg(1)%b(1:ffe_vg(1)%n)/b)),1)
+       FFE_Test_Value=ffe_vg(1)%b(i0)
     CASE DEFAULT
        FFE_Test_Value=0d0
     END SELECT
