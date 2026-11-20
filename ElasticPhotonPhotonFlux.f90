@@ -124,12 +124,14 @@ MODULE ElasticPhotonPhotonFlux
   INTEGER,PRIVATE,SAVE::ffe_nbeta=0
   REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_beta
   REAL(KIND(1d0)),PRIVATE,SAVE::ffe_bcut=0d0
+  LOGICAL,PRIVATE,SAVE::ffe_pjump=.FALSE.   ! P jumps to 1 at bcut (closed-form MC-Glauber fits)
   ! kernel matrices: 1 flux, 2 <Delta b> numerator (fm), 3 <Delta b> numerator with PNOHAD=1 (fm)
   REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_K
   LOGICAL,DIMENSION(3),PRIVATE,SAVE::ffe_Kready=.FALSE.
   INTEGER,PRIVATE,SAVE::ffe_nodes=0,ffe_nguard=0
-  ! grids in log10 x: node i <-> log10 x = -(i-1)/ffe_nseg, i = 1..ffe_MX+1
-  INTEGER,PARAMETER,PRIVATE::ffe_nseg=20
+  ! grids in u = -log10 x: piecewise uniform, 80 nodes per decade for x > 1e-2 (the ChFF flux has a
+  ! shoulder at the first zero of the form factor), 20 below; node 1 is x = 1, node ffe_MX+1 is xmin
+  TYPE(ffe_vgrid_t),PRIVATE,SAVE::ffe_xg
   INTEGER,PRIVATE,SAVE::ffe_MX=0
   REAL(KIND(1d0)),PRIVATE,SAVE::ffe_xmin=1d-8
   REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_W  ! (MX+1, nv, beam)
@@ -138,7 +140,7 @@ MODULE ElasticPhotonPhotonFlux
   REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_lnN ! ln(int W dv) per grid x and beam
   REAL(KIND(1d0)),DIMENSION(6),PRIVATE,SAVE::ffe_time=0d0         ! setup, W, P, K, grid, total (CPU s)
   ! fine P table and far-zone moment tables of the kernel
-  INTEGER,PARAMETER,PRIVATE::FFE_NMOM=10
+  INTEGER,PARAMETER,PRIVATE::FFE_NMOM=26
   INTEGER,PRIVATE,SAVE::ffe_nf=0,ffe_ng=0
   REAL(KIND(1d0)),PRIVATE,SAVE::ffe_hf=0d0,ffe_hg=0d0
   REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_Pf
@@ -10774,6 +10776,7 @@ CONTAINS
           EXIT
        ENDIF
     ENDDO
+    ffe_pjump=jump
     IF(jump)THEN
        ! closed-form fit with a hard cut-off: P jumps to 1 at the first zero
        bm=bt(icut)
@@ -10920,7 +10923,7 @@ CONTAINS
   SUBROUTINE ffe_build_pfast()
     ! fine table of P(b) itself (uniform in b, step a/32) for fast 6-point lookups in Phi, and the
     ! moment tables g_2n(d) = int_0^tauB tau^2n (1-P(sqrt(d^2+tau^2))) [* b12 in fm] dtau of the
-    ! far-zone expansion Phi = 2pi - (2/sqrt(G)) sum_n c_n g_2n(|d|)/(4G)^n, G = b1 b2 >= 4 bcut^2
+    ! far-zone expansion Phi = 2pi - (2/sqrt(G)) sum_n c_n g_2n(|d|)/(4G)^n, G = b1 b2 >= bcut^2
     IMPLICIT NONE
     INTEGER::i,k,n,np,g,m
     REAL(KIND(1d0))::d,tb,t0,t1,hh,cc,tau,b12,om,pw
@@ -10929,6 +10932,8 @@ CONTAINS
     ffe_hf=MIN(ffe_bm(1)%a,ffe_bm(2)%a)/32d0
     IF(ffe_icoll.EQ.2)ffe_hf=ffe_bm(2)%a/32d0
     ffe_nf=INT(ffe_bcut/ffe_hf)+8
+    ! a jump at bcut: keep the stencils on the nodes below it
+    IF(ffe_pjump)ffe_nf=INT(ffe_bcut/ffe_hf*(1d0-1d-12))+1
     IF(ALLOCATED(ffe_Pf))DEALLOCATE(ffe_Pf)
     ALLOCATE(ffe_Pf(ffe_nf))
     DO i=1,ffe_nf
@@ -11051,8 +11056,8 @@ CONTAINS
           ! P < 1e-14 everywhere on the circle
           RETURN
        ENDIF
-       IF(Gp.GE.4d0*ffe_bcut**2)THEN
-          ! far zone: expansion in tau^2/(4G) <= 1/16 with the moment tables
+       IF(Gp.GE.ffe_bcut**2)THEN
+          ! far zone: expansion in tau^2/(4G) <= 1/4 with the moment tables (26 terms: < 1e-16)
           u=ad/ffe_hg
           CALL ffe_lagu(u,ffe_ng,8,i0,wt)
           y=1d0/G4
@@ -11129,8 +11134,9 @@ CONTAINS
          0.2d0,0.3d0,0.5d0,1d0/)
     REAL(KIND(1d0)),DIMENSION(8)::x8,w8
     REAL(KIND(1d0)),DIMENSION(5)::x5,w5
-    INTEGER::nb,k,i,np,ns,j,g
-    REAL(KIND(1d0))::V1lo,V1hi,V2lo,V2hi,tlo,thi,es,x,len,h,a,ht
+    INTEGER::nb,k,i,np,ns,j,g,nj
+    REAL(KIND(1d0))::V1lo,V1hi,V2lo,V2hi,tlo,thi,es,x,len,h,a,ht,u,tj(4),ta,tb
+    LOGICAL::lsing,rsing
     IF(.NOT.ALLOCATED(br))ALLOCATE(br(40000))
     V1lo=ffe_vg(1)%v(1)
     V1hi=ffe_vg(1)%v(ffe_vg(1)%n)
@@ -11181,6 +11187,23 @@ CONTAINS
           nb=nb+2
        ENDDO
     ENDIF
+    ! lines where P jumps (closed-form fits with a hard cut-off): Phi ~ sqrt(distance) there
+    nj=0
+    IF(ffe_pjump)THEN
+       x=ffe_bcut/(2d0*es)
+       tj(1)=ASINH(x)
+       tj(2)=-tj(1)
+       nj=2
+       IF(x.GT.1d0)THEN
+          tj(3)=ACOSH(x)
+          tj(4)=-tj(3)
+          nj=4
+       ENDIF
+       DO k=1,nj
+          nb=nb+1
+          br(nb)=tj(k)
+       ENDDO
+    ENDIF
     CALL ffe_breaks(nb,br,tlo,thi,1d-13,np)
     CALL ffe_gauleg(8,x8,w8)
     CALL ffe_gauleg(5,x5,w5)
@@ -11189,6 +11212,42 @@ CONTAINS
        len=br(i+1)-br(i)
        ns=MAX(1,CEILING(len/ht-1d-9))
        h=len/DBLE(ns)
+       lsing=.FALSE.
+       rsing=.FALSE.
+       DO k=1,nj
+          IF(DABS(br(i)-tj(k)).LT.1d-12)lsing=.TRUE.
+          IF(DABS(br(i+1)-tj(k)).LT.1d-12)rsing=.TRUE.
+       ENDDO
+       IF(lsing.OR.rsing)THEN
+          ! u^2 substitution towards the singular end(s), 16 nodes
+          CALL ffe_gauleg(8,x8,w8)
+          ta=br(i)
+          tb=br(i+1)
+          IF(lsing.AND.rsing)THEN
+             ! both ends: split in the middle
+             DO g=1,8
+                u=0.5d0*(1d0+x8(g))
+                nt=nt+1
+                tt(nt)=ta+0.5d0*len*u*u
+                wt(nt)=0.5d0*w8(g)*len*u*0.5d0*2d0
+                nt=nt+1
+                tt(nt)=tb-0.5d0*len*u*u
+                wt(nt)=0.5d0*w8(g)*len*u*0.5d0*2d0
+             ENDDO
+          ELSE
+             DO g=1,16/2
+                u=0.5d0*(1d0+x8(g))
+                nt=nt+1
+                IF(lsing)THEN
+                   tt(nt)=ta+len*u*u
+                ELSE
+                   tt(nt)=tb-len*u*u
+                ENDIF
+                wt(nt)=0.5d0*w8(g)*2d0*len*u
+             ENDDO
+          ENDIF
+          CYCLE
+       ENDIF
        DO j=1,ns
           a=br(i)+(DBLE(j)-0.5d0)*h
           IF(h.GT.0.02d0.OR.FFE_NodeScale.GT.1.5d0)THEN
@@ -11387,9 +11446,28 @@ CONTAINS
     DO i=1,nint
        ia(i)=slo+DBLE(i-1)*h
        ibb(i)=ia(i)+h
+    ENDDO
+    IF(ffe_pjump)THEN
+       ! a jump of P at bcut: the line b1+b2 = bcut touches t = 0 at s = ln(bcut/2), where the
+       ! inner integral has a square-root singularity -> make it an interval end
+       c=DLOG(0.5d0*ffe_bcut)
+       DO i=1,nint
+          IF(c.GT.ia(i)+1d-9.AND.c.LT.ibb(i)-1d-9)THEN
+             nint=nint+1
+             ia(nint)=c
+             ibb(nint)=ibb(i)
+             ibb(i)=c
+             EXIT
+          ENDIF
+       ENDDO
+    ENDIF
+    DO i=1,nint
        CALL ffe_gk21(i)
     ENDDO
     tol=1d-9/MAX(FFE_NodeScale,1d-3)**2
+    ! kernels with a jump (closed-form MC-Glauber fits with a hard cut-off) converge only
+    ! algebraically near the jump lines: 1e-7 is still two orders below the 1e-5 target
+    IF(ffe_pjump)tol=1d-7/MAX(FFE_NodeScale,1d-3)**2
     DO it=1,nimax
        Tot(1:npx)=Tf(1:npx)+SUM(res(1:npx,1:nint),DIM=2)
        errsum=0d0
@@ -11482,8 +11560,21 @@ CONTAINS
     IMPLICIT NONE
     INTEGER::ffe_xindex
     REAL(KIND(1d0)),INTENT(IN)::x
-    ffe_xindex=1+NINT(-DLOG10(x)*DBLE(ffe_nseg))
-    ffe_xindex=MAX(1,MIN(ffe_xindex,ffe_MX+1))
+    INTEGER::lo,hi,mid
+    REAL(KIND(1d0))::u
+    u=-DLOG10(x)
+    lo=1
+    hi=ffe_MX+1
+    DO WHILE(hi-lo.GT.1)
+       mid=(lo+hi)/2
+       IF(ffe_xg%v(mid).LE.u)THEN
+          lo=mid
+       ELSE
+          hi=mid
+       ENDIF
+    ENDDO
+    ffe_xindex=lo
+    IF(DABS(ffe_xg%v(hi)-u).LT.DABS(ffe_xg%v(lo)-u))ffe_xindex=hi
   END FUNCTION ffe_xindex
 
   SUBROUTINE ffe_build_grid(k)
@@ -11523,8 +11614,8 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(p)::w1,w2
     INTEGER::i0,j0,a
     REAL(KIND(1d0))::L
-    CALL ffe_lagu(-DLOG10(x1)*DBLE(ffe_nseg),ffe_MX+1,p,i0,w1)
-    CALL ffe_lagu(-DLOG10(x2)*DBLE(ffe_nseg),ffe_MX+1,p,j0,w2)
+    CALL ffe_lagw(ffe_xg,-DLOG10(x1),p,i0,w1)
+    CALL ffe_lagw(ffe_xg,-DLOG10(x2),p,j0,w2)
     L=0d0
     DO a=1,p
        L=L+w1(a)*SUM(w2*ffe_ZL(i0+a,j0+1:j0+p,k))
@@ -11570,9 +11661,9 @@ CONTAINS
        n2=DOT_PRODUCT(ffe_vg(2)%qw,W)
        DEALLOCATE(W)
     ELSE
-       CALL ffe_lagu(-DLOG10(x1)*DBLE(ffe_nseg),ffe_MX+1,p,i0,wt)
+       CALL ffe_lagw(ffe_xg,-DLOG10(x1),p,i0,wt)
        n1=DEXP(SUM(wt*ffe_lnN(i0+1:i0+p,1)))
-       CALL ffe_lagu(-DLOG10(x2)*DBLE(ffe_nseg),ffe_MX+1,p,i0,wt)
+       CALL ffe_lagw(ffe_xg,-DLOG10(x2),p,i0,wt)
        n2=DEXP(SUM(wt*ffe_lnN(i0+1:i0+p,2)))
     ENDIF
     ffe_pnohad1=fourpi2*ffe_alpha**2*ffe_bm(1)%znum**2*ffe_bm(2)%znum**2*n1*n2/(x1*x2)
@@ -11708,7 +11799,8 @@ CONTAINS
     ffe_time(2)=t1-t0
     t0=t1
     ! --------------------------------------------- photon densities on the grid --
-    ffe_MX=NINT(-DLOG10(ffe_xmin))*ffe_nseg
+    CALL ffe_build_xgrid(DBLE(NINT(-DLOG10(ffe_xmin))))
+    ffe_MX=ffe_xg%n-1
     IF(ALLOCATED(ffe_W))DEALLOCATE(ffe_W)
     ALLOCATE(ffe_W(ffe_MX+1,MAX(ffe_vg(1)%n,ffe_vg(2)%n),2))
     IF(ALLOCATED(ffe_lnN))DEALLOCATE(ffe_lnN)
@@ -11717,7 +11809,7 @@ CONTAINS
     DO ib=1,2
        ALLOCATE(Wr(ffe_vg(ib)%n))
        DO i=1,ffe_MX+1
-          CALL ffe_W_row(ib,10d0**(-DBLE(i-1)/DBLE(ffe_nseg)),Wr)
+          CALL ffe_W_row(ib,10d0**(-ffe_xg%v(i)),Wr)
           ffe_W(i,1:ffe_vg(ib)%n,ib)=Wr
           ffe_lnN(i,ib)=DLOG(MAX(DOT_PRODUCT(ffe_vg(ib)%qw,Wr),1d-300))
        ENDDO
@@ -12205,5 +12297,38 @@ CONTAINS
        ffe_api=ffe_flux(icoll,x1,x2,MERGE(3,2,force),MERGE(0,1,grid))
     ENDIF
   END FUNCTION ffe_api
+
+
+  SUBROUTINE ffe_build_xgrid(umax)
+    ! x grid in u = -log10 x on [0, umax]: h = 1/80 for u < 2, h = 1/20 beyond
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::umax
+    INTEGER::n1,n2,k,m
+    REAL(KIND(1d0))::sc
+    sc=MAX(FFE_NodeScale,1d0)
+    IF(ALLOCATED(ffe_xg%v))DEALLOCATE(ffe_xg%v,ffe_xg%b,ffe_xg%qw,ffe_xg%slo,ffe_xg%shi,ffe_xg%sv0,ffe_xg%sh)
+    n1=NINT(160d0*sc)
+    n2=NINT((umax-2d0)*20d0*sc)
+    ffe_xg%nseg=2
+    ffe_xg%n=1+n1+n2
+    ALLOCATE(ffe_xg%v(ffe_xg%n),ffe_xg%b(ffe_xg%n),ffe_xg%qw(ffe_xg%n))
+    ALLOCATE(ffe_xg%slo(2),ffe_xg%shi(2),ffe_xg%sv0(2),ffe_xg%sh(2))
+    ffe_xg%sv0=(/0d0,2d0/)
+    ffe_xg%sh=(/2d0/DBLE(n1),(umax-2d0)/DBLE(n2)/)
+    ffe_xg%slo=(/1,1+n1/)
+    ffe_xg%shi=(/1+n1,ffe_xg%n/)
+    k=0
+    DO m=0,n1
+       k=k+1
+       ffe_xg%v(k)=DBLE(m)*ffe_xg%sh(1)
+    ENDDO
+    DO m=1,n2
+       k=k+1
+       ffe_xg%v(k)=2d0+DBLE(m)*ffe_xg%sh(2)
+    ENDDO
+    ffe_xg%v(ffe_xg%n)=umax
+    ffe_xg%b=10d0**(-ffe_xg%v)
+    ffe_xg%qw=0d0
+  END SUBROUTINE ffe_build_xgrid
 
 END MODULE ElasticPhotonPhotonFlux
