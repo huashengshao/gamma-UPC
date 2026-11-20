@@ -29,9 +29,10 @@ PROGRAM bench_ab
   REAL(KIND(1d0))::Wdbmin=2d0,Wdbmax=200d0
   INTEGER::algorithm=-1       ! new code only: PhotonPhotonFlux_Algorithm (-1 = library default)
   LOGICAL::deltab_grid=.FALSE. ! GENERATE_DELTAB_GRID
+  LOGICAL::dbpoints=.FALSE.    ! evaluate the <Delta b> numerator (direct) instead of the flux at the points
   NAMELIST /config/ label,code_label,points_file,out_file,icoll,A1,Z1,A2,Z2,E1,E2,chff,&
        conj_sum,mc_glauber,tag1,tag2,iepsilon,do_grid,do_eval,do_pnohad1,eval_kinds,&
-       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid
+       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,dbpoints
   ! ----------------------------------------------------------------- state --
   CHARACTER(len=400)::arg
   INTEGER::iu,ios,np,i,kind_i
@@ -246,6 +247,14 @@ CONTAINS
     REAL(KIND(1d0))::flux_eval
     REAL(KIND(1d0)),INTENT(IN)::x1,x2
     LOGICAL,INTENT(IN)::pnohad1
+    IF(dbpoints.AND..NOT.pnohad1)THEN
+       IF(icoll.EQ.3)THEN
+          flux_eval=PhotonPhotonDeltaB_AB_WoodsSaxon_eval(x1,x2)
+       ELSE
+          flux_eval=PhotonPhotonDeltaB_pA_WoodsSaxon_eval(x1,x2)
+       ENDIF
+       RETURN
+    ENDIF
     IF(icoll.EQ.3)THEN
        flux_eval=PhotonPhotonFlux_AB_WoodsSaxon_eval(x1,x2,pnohad1)
     ELSE

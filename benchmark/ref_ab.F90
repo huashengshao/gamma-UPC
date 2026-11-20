@@ -51,6 +51,7 @@ MODULE ref_state
   INTEGER::ib_c,ib_cur
   REAL(KIND(1d0))::r_c,b_c,q_c,s_c,bb_c,d_c,G4_c,x_c1,x_c2,v1_c,b1_c
   INTEGER::neval_tot=0
+  LOGICAL::wdb=.FALSE.   ! <Delta b> numerator: kernel P(b12)*b12 (fm)
 END MODULE ref_state
 
 MODULE ref_funcs
@@ -378,8 +379,11 @@ CONTAINS
     REAL(KIND(1d0))::f_phi
     REAL(KIND(1d0)),INTENT(IN)::phi
     REAL(KIND(1d0))::sn
+    REAL(KIND(1d0))::b12
     sn=DSIN(0.5d0*phi)
-    f_phi=Ptot(DSQRT(d_c*d_c+G4_c*sn*sn))
+    b12=DSQRT(d_c*d_c+G4_c*sn*sn)
+    f_phi=Ptot(b12)
+    IF(wdb)f_phi=f_phi*b12*GeVm12fm
     neval_tot=neval_tot+1
   END FUNCTION f_phi
 
@@ -391,7 +395,7 @@ CONTAINS
     d_c=b1-b2
     ad=DABS(d_c)
     G4_c=4d0*b1*b2
-    IF(.NOT.tag.AND.ad.GE.bcut)THEN
+    IF(.NOT.tag.AND..NOT.wdb.AND.ad.GE.bcut)THEN
        Phi_k=2d0*pi
        RETURN
     ENDIF
@@ -475,7 +479,7 @@ PROGRAM ref_ab
   REAL(KIND(1d0))::Wmin=1d0,Wmax=1d0,Wdbmin=1d0,Wdbmax=1d0
   NAMELIST /config/ label,code_label,points_file,out_file,icoll,A1,Z1,A2,Z2,E1,E2,chff,&
        conj_sum,mc_glauber,tag1,tag2,iepsilon,do_grid,do_eval,do_pnohad1,eval_kinds,&
-       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid
+       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,wdb
   CHARACTER(len=400)::arg
   CHARACTER(len=7)::aname
   INTEGER::iu,ios,np,i,kind_i,ib,ier,j,k
@@ -483,6 +487,7 @@ PROGRAM ref_ab
   INTEGER,DIMENSION(2000)::pk
   REAL(KIND(1d0))::xr1,xr2,anum,znum,rr,adif,wpar,cme,res,err,lo,hi,t0,t1,alpha,pts(10)
   REAL(KIND(1d0)),DIMENSION(2)::xlast
+  LOGICAL::swap
   CALL GET_COMMAND_ARGUMENT(1,arg)
   OPEN(NEWUNIT=iu,FILE=TRIM(arg),STATUS='OLD')
   READ(iu,NML=config)
@@ -501,10 +506,27 @@ PROGRAM ref_ab
   alpha=0.0072992700729927005d0
   use_MC_Glauber=mc_glauber
   IEPSILON_EDFF=iepsilon
-  IF(icoll.NE.3)STOP "ref_ab: pA reference not implemented yet"
-  ! beams
+  ! beams (engine convention for pA: beam 1 is the proton)
+  swap=icoll.EQ.2.AND.nuclearA_beam1.NE.0
   DO ib=1,2
-     IF(ib.EQ.1)THEN
+     IF(icoll.EQ.2.AND.ib.EQ.1)THEN
+        isp(1)=.TRUE.
+        AA_(1)=1d0
+        ZZ(1)=1d0
+        RA(1)=0.877d0/GeVm12fm
+        mass(1)=mproton
+        gam(1)=MERGE(E2,E1,swap)/mproton
+        bmin(1)=RA(1)
+        IF(chff)bmin(1)=1d-3*bmin(1)
+        CYCLE
+     ENDIF
+     IF(icoll.EQ.2)THEN
+        IF(swap)THEN
+           aname=GetASymbol(A1,Z1)
+        ELSE
+           aname=GetASymbol(A2,Z2)
+        ENDIF
+     ELSEIF(ib.EQ.1)THEN
         aname=GetASymbol(A1,Z1)
      ELSE
         aname=GetASymbol(A2,Z2)
@@ -517,7 +539,11 @@ PROGRAM ref_ab
      aa(ib)=adif/GeVm12fm
      ww(ib)=wpar
      mass(ib)=mN
-     gam(ib)=ebeam(ib)/mN
+     IF(icoll.EQ.2)THEN
+        gam(ib)=MERGE(E1,E2,swap)/mN
+     ELSE
+        gam(ib)=ebeam(ib)/mN
+     ENDIF
      bmin(ib)=RA(ib)
      IF(iepsilon.EQ.1)bmin(ib)=RA(ib)+aa(ib)
      IF(chff)bmin(ib)=1d-3*bmin(ib)
@@ -536,9 +562,10 @@ PROGRAM ref_ab
         ENDDO
      ENDDO
   ENDDO
+  IF(icoll.EQ.2)aa(1)=aa(2)
   IF(chff)THEN
      DO ib=1,2
-        CALL build_FF(ib)
+        IF(.NOT.isp(ib))CALL build_FF(ib)
      ENDDO
   ENDIF
   cme=2d0*DSQRT(E1*E2)
@@ -575,17 +602,23 @@ PROGRAM ref_ab
   xlast=-1d0
   DO i=1,np
      CALL CPU_TIME(t0)
-     x_c1=px1(i)
-     x_c2=px2(i)
-     IF(chff)THEN
-        IF(px1(i).NE.xlast(1))CALL build_amp(1,px1(i))
-        IF(px2(i).NE.xlast(2))CALL build_amp(2,px2(i))
-        xlast=(/px1(i),px2(i)/)
+     ! engine beam order: (x of beam 1, x of beam 2); for A+p beam 1 is the proton = user beam 2
+     IF(swap)THEN
+        xr1=px2(i)
+        xr2=px1(i)
+     ELSE
+        xr1=px1(i)
+        xr2=px2(i)
      ENDIF
-     x_c1=px1(i)
-     x_c2=px2(i)
+     IF(chff)THEN
+        IF(.NOT.isp(1).AND.xr1.NE.xlast(1))CALL build_amp(1,xr1)
+        IF(.NOT.isp(2).AND.xr2.NE.xlast(2))CALL build_amp(2,xr2)
+        xlast=(/xr1,xr2/)
+     ENDIF
+     x_c1=xr1
+     x_c2=xr2
      lo=DLOG(bmin(1))
-     hi=DLOG(45d0/(px1(i)*mass(1)))
+     hi=DLOG(45d0/(xr1*mass(1)))
      pts(1)=DLOG(RA(1))
      CALL gk21_adapt(f_u1,lo,hi,0d0,1d-9,res,err,ier,1,pts)
      val(i)=2d0*pi*alpha**2*ZZ(1)**2*ZZ(2)**2*res/(px1(i)*px2(i))
