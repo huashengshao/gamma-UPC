@@ -50,7 +50,12 @@ MODULE ref_state
   ! integration state
   INTEGER::ib_c,ib_cur
   REAL(KIND(1d0))::r_c,b_c,q_c,s_c,bb_c,d_c,G4_c,x_c1,x_c2,v1_c,b1_c
-  INTEGER::neval_tot=0
+  INTEGER::neval_tot=0,nmid=0,nmid_ier=0,nphi=0,nphi_ier=0,nu1=0
+  REAL(KIND(1d0))::reltol_outer=1d-8,wn2=0d0,wn2b=0d0
+  LOGICAL::debug=.FALSE.
+  INTEGER::njump=0
+  REAL(KIND(1d0)),DIMENSION(10)::bjump
+  INTEGER::nf2=0
   LOGICAL::wdb=.FALSE.   ! <Delta b> numerator: kernel P(b12)*b12 (fm)
 END MODULE ref_state
 
@@ -180,6 +185,7 @@ CONTAINS
          0.7d0,0.9d0,0.99d0,0.9999d0,0.999999d0,0.99999999d0/)
     amin=MIN(aa(1),aa(2))
     hb=amin/16d0
+    np_t=0
     bcut=1d300
     DO i=INT((RA(1)+RA(2)+80d0*amin)/hb),1,-1
        b=DBLE(i)*hb
@@ -212,18 +218,68 @@ CONTAINS
     ENDDO
     nbeta=nbeta+1
     beta(nbeta)=bcut
+    hb=amin/64d0
+    np_t=INT(bcut/hb)+9
+    IF(ALLOCATED(lnchi))DEALLOCATE(lnchi)
+    ALLOCATE(lnchi(np_t))
+    DO i=1,np_t
+       lnchi(i)=Phad_engine(DBLE(i-1)*hb)
+    ENDDO
+    ! discontinuities of P (MC-Glauber fits): a step much larger than both neighbouring steps;
+    ! located by bisection, used as breakpoints, and P is taken from the engine next to them
+    njump=0
+    DO i=2,np_t-2
+       b1=DABS(lnchi(i+1)-lnchi(i))
+       IF(b1.GT.1d-6.AND.b1.GT.20d0*MAX(DABS(lnchi(i)-lnchi(i-1)),DABS(lnchi(i+2)-lnchi(i+1))))THEN
+          b1=DBLE(i-1)*hb
+          b2=DBLE(i)*hb
+          bm=Phad_engine(b1)
+          DO j=1,80
+             IF(DABS(Phad_engine(0.5d0*(b1+b2))-bm).LT.0.5d0*DABS(lnchi(i+1)-lnchi(i)))THEN
+                b1=0.5d0*(b1+b2)
+             ELSE
+                b2=0.5d0*(b1+b2)
+             ENDIF
+          ENDDO
+          IF(njump.LT.10)THEN
+             njump=njump+1
+             bjump(njump)=b2
+             nbeta=nbeta+1
+             beta(nbeta)=b2
+             WRITE(*,*)"REF: P jump at b [fm] =",b2*GeVm12fm,", from",lnchi(i)," to",lnchi(i+1)
+          ENDIF
+       ENDIF
+    ENDDO
   END SUBROUTINE build_P
 
-  FUNCTION Phad(b)
+  FUNCTION Phad_engine(b)
     ! hadronic survival probability: the engine's table (validated separately, row A_tab)
     USE ElasticPhotonPhotonFlux,ONLY:FFE_Test_Value
+    REAL(KIND(1d0))::Phad_engine
+    REAL(KIND(1d0)),INTENT(IN)::b
+    Phad_engine=FFE_Test_Value(2,icoll_r,1d-3,b*GeVm12fm)
+  END FUNCTION Phad_engine
+
+  FUNCTION Phad(b)
+    ! fine local table of Phad_engine (spacing a/64, 8-point Lagrange), P = 1 beyond bcut
     REAL(KIND(1d0))::Phad
     REAL(KIND(1d0)),INTENT(IN)::b
+    INTEGER::i
     IF(b.GE.bcut)THEN
        Phad=1d0
        RETURN
     ENDIF
-    Phad=FFE_Test_Value(2,icoll_r,1d-3,b*GeVm12fm)
+    IF(np_t.LE.0)THEN
+       Phad=Phad_engine(b)
+       RETURN
+    ENDIF
+    DO i=1,njump
+       IF(DABS(b-bjump(i)).LT.6d0*hb)THEN
+          Phad=Phad_engine(b)
+          RETURN
+       ENDIF
+    ENDDO
+    Phad=MIN(1d0,MAX(0d0,lag8(b/hb,np_t,lnchi)))
   END FUNCTION Phad
 
   FUNCTION Ptot(b)
@@ -341,6 +397,8 @@ CONTAINS
        CALL gk21_adapt(f_kpar,0d0,kmax,1d-16*q,1d-12,res,err,ier,nk,pts)
        atab(i,2,ib)=res
     ENDDO
+    IF(debug)WRITE(*,*)"DBG amp ib,nva,nan count,first,last",ib,nva(ib),COUNT(atab(1:nva(ib),:,ib).NE.atab(1:nva(ib),:,ib)),&
+         atab(1,1,ib),atab(nva(ib),1,ib)
   END SUBROUTINE build_amp
 
   FUNCTION Wfun(ib,x,b)
@@ -406,7 +464,9 @@ CONTAINS
        np=np+1
        pts(np)=2d0*DASIN(DSQRT(arg))
     ENDDO
-    CALL gk21_adapt(f_phi,0d0,pi,1d-15,1d-13,res,err,ier,np,pts)
+    CALL gk21_adapt(f_phi,0d0,pi,1d-15,1d-12,res,err,ier,np,pts)
+    nphi=nphi+1
+    IF(ier.NE.0)nphi_ier=nphi_ier+1
     Phi_k=2d0*res
   END FUNCTION Phi_k
 
@@ -415,6 +475,7 @@ CONTAINS
     REAL(KIND(1d0)),INTENT(IN)::v2
     REAL(KIND(1d0))::b2,w2
     b2=DEXP(v2)
+    nf2=nf2+1
     w2=Wfun(2,x_c2,b2)
     IF(w2.EQ.0d0)THEN
        f_u2=0d0
@@ -423,12 +484,25 @@ CONTAINS
     f_u2=w2*Phi_k(b1_c,b2)
   END FUNCTION f_u2
 
+  FUNCTION f_w2n(v2)
+    REAL(KIND(1d0))::f_w2n
+    REAL(KIND(1d0)),INTENT(IN)::v2
+    f_w2n=Wfun(2,x_c2,DEXP(v2))
+  END FUNCTION f_w2n
+
+  FUNCTION f_w2b(v2)
+    REAL(KIND(1d0))::f_w2b
+    REAL(KIND(1d0)),INTENT(IN)::v2
+    f_w2b=Wfun(2,x_c2,DEXP(v2))*DEXP(v2)
+  END FUNCTION f_w2b
+
   FUNCTION f_u1(v1)
     REAL(KIND(1d0))::f_u1
     REAL(KIND(1d0)),INTENT(IN)::v1
-    REAL(KIND(1d0))::w1,res,err,pts(500),lo,hi,bb
+    REAL(KIND(1d0))::w1,res,err,pts(500),lo,hi,bb,eabs
     INTEGER::ier,np,i
     b1_c=DEXP(v1)
+    nu1=nu1+1
     w1=Wfun(1,x_c1,b1_c)
     IF(w1.EQ.0d0)THEN
        f_u1=0d0
@@ -458,7 +532,18 @@ CONTAINS
        np=np+1
        pts(np)=DLOG(RA(2))
     ENDIF
-    CALL gk21_adapt(f_u2,lo,hi,0d0,1d-11,res,err,ier,np,pts)
+    ! absolute tolerance: 1e-12 of the unsuppressed scale (Phi <= 2 pi, or 2 pi b12 for <Delta b>);
+    ! without it the integral stalls at the noise floor where Phi ~ 0 (b1, b2 inside the overlap)
+    IF(wdb)THEN
+       eabs=1d-12*2d0*pi*GeVm12fm*(b1_c*wn2+wn2b)
+    ELSE
+       eabs=1d-12*2d0*pi*wn2
+    ENDIF
+    CALL gk21_adapt(f_u2,lo,hi,eabs,1d-10,res,err,ier,np,pts)
+    nmid=nmid+1
+    IF(ier.NE.0)nmid_ier=nmid_ier+1
+    IF(debug)WRITE(*,'(A,ES12.4,A,I9,A,I9,A,I9,A,I2,A,ES12.4,A,ES12.4)')" DBG b1=",b1_c," nf2=",nf2," nphi=",nphi,&
+         " nP=",neval_tot," ier=",ier," res=",res," err=",err
     f_u1=w1*res
   END FUNCTION f_u1
 END MODULE ref_funcs
@@ -479,7 +564,7 @@ PROGRAM ref_ab
   REAL(KIND(1d0))::Wmin=1d0,Wmax=1d0,Wdbmin=1d0,Wdbmax=1d0
   NAMELIST /config/ label,code_label,points_file,out_file,icoll,A1,Z1,A2,Z2,E1,E2,chff,&
        conj_sum,mc_glauber,tag1,tag2,iepsilon,do_grid,do_eval,do_pnohad1,eval_kinds,&
-       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,wdb
+       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,wdb,reltol_outer,debug
   CHARACTER(len=400)::arg
   CHARACTER(len=7)::aname
   INTEGER::iu,ios,np,i,kind_i,ib,ier,j,k
@@ -551,11 +636,13 @@ PROGRAM ref_ab
      rho0(ib)=1d0
      ib_c=ib
      pts(1)=RA(ib)
-     CALL gk21_adapt(f_norm,0d0,RA(ib)+70d0*aa(ib),0d0,1d-14,res,err,ier,1,pts)
+     CALL gk21_adapt(f_norm,0d0,RA(ib)+70d0*aa(ib),0d0,1d-13,res,err,ier,1,pts)
+     IF(ier.NE.0.OR.res.LE.0d0)STOP 'REF: density normalisation failed'
      rho0(ib)=1d0/res
      DO k=0,12
         r_c=DBLE(k)
-        CALL gk21_adapt(f_mom,0d0,RA(ib)+70d0*aa(ib),0d0,1d-14,res,err,ier,1,pts)
+        CALL gk21_adapt(f_mom,0d0,RA(ib)+70d0*aa(ib),0d0,1d-13,res,err,ier,1,pts)
+        IF(ier.EQ.6)STOP 'REF: invalid tolerance'
         rmom(k,ib)=res
         DO j=1,2*k+1
            rmom(k,ib)=rmom(k,ib)/DBLE(j)
@@ -617,13 +704,24 @@ PROGRAM ref_ab
      ENDIF
      x_c1=xr1
      x_c2=xr2
+     pts(1)=DLOG(RA(2))
+     CALL gk21_adapt(f_w2n,DLOG(bmin(2)),DLOG(45d0/(xr2*mass(2))),0d0,1d-10,wn2,err,ier,1,pts)
+     CALL gk21_adapt(f_w2b,DLOG(bmin(2)),DLOG(45d0/(xr2*mass(2))),0d0,1d-10,wn2b,err,ier,1,pts)
+     IF(debug)WRITE(*,*)"DBG wn2,wn2b",wn2,wn2b
      lo=DLOG(bmin(1))
      hi=DLOG(45d0/(xr1*mass(1)))
      pts(1)=DLOG(RA(1))
-     CALL gk21_adapt(f_u1,lo,hi,0d0,1d-9,res,err,ier,1,pts)
+     CALL gk21_adapt(f_u1,lo,hi,0d0,reltol_outer,res,err,ier,1,pts)
      val(i)=2d0*pi*alpha**2*ZZ(1)**2*ZZ(2)**2*res/(px1(i)*px2(i))
      er(i)=2d0*pi*alpha**2*ZZ(1)**2*ZZ(2)**2*err/(px1(i)*px2(i))
      CALL CPU_TIME(t1)
+     WRITE(*,'(A,I8,A,I6,A,I10,A,I8,A,I10,A,I3)')" REF: diag nmid=",nmid," mid_ier=",nmid_ier," nphi=",nphi,&
+          " phi_ier=",nphi_ier," nP=",neval_tot," outer ier=",ier
+     nmid=0
+     nmid_ier=0
+     nphi=0
+     nphi_ier=0
+     neval_tot=0
      WRITE(*,'(A,2ES12.4,A,ES24.16,A,ES9.2,A,I2,A,F8.2)')" REF: x1,x2=",px1(i),px2(i)," flux=",val(i),&
           " relerr=",er(i)/val(i)," ier=",ier," t[s]=",t1-t0
   ENDDO

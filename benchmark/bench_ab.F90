@@ -31,9 +31,11 @@ PROGRAM bench_ab
   LOGICAL::deltab_grid=.FALSE. ! GENERATE_DELTAB_GRID
   LOGICAL::dbpoints=.FALSE.    ! evaluate the <Delta b> numerator (direct) instead of the flux at the points
   LOGICAL::legacy_defs=.FALSE. ! new code only: FFE_Legacy_ChFF_Definitions
+  REAL(KIND(1d0))::node_scale=1d0 ! new code only: FFE_NodeScale (convergence studies)
   NAMELIST /config/ label,code_label,points_file,out_file,icoll,A1,Z1,A2,Z2,E1,E2,chff,&
        conj_sum,mc_glauber,tag1,tag2,iepsilon,do_grid,do_eval,do_pnohad1,eval_kinds,&
-       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,dbpoints,legacy_defs
+       nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,dbpoints,legacy_defs,&
+       node_scale
   ! ----------------------------------------------------------------- state --
   CHARACTER(len=400)::arg
   INTEGER::iu,ios,np,i,kind_i
@@ -85,6 +87,7 @@ PROGRAM bench_ab
 #ifdef GUPC_NEW
   IF(algorithm.GE.0)PhotonPhotonFlux_Algorithm=algorithm
   FFE_Legacy_ChFF_Definitions=legacy_defs
+  FFE_NodeScale=node_scale
 #endif
 
   ! points
