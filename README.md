@@ -21,11 +21,12 @@ gamma-UPC computes the effective γγ luminosities that event generators such as
 | `ElasticPhotonPhotonFlux.f90` | module `ElasticPhotonPhotonFlux`: photon fluxes, γγ fluxes and luminosities, ⟨Δb⟩, neutron tagging, the user switches |
 | `OpticalGlauber_Geometry.f90` | module `OpticalGlauber_Geometry`: Woods–Saxon nuclei, thickness functions, T̂_AB, σ_inel(NN), MC-Glauber fits |
 | `photoabsorption.f90` | photo-absorption and photo-neutron cross sections for neutron tagging |
-| `nintlib.f90`, `interpolation.f90`, `fmin_module.f90` | multidimensional quadrature (`ROMBERG_ND` and others), polynomial and spline interpolation, minimisation |
+| `nintlib.f90`, `interpolation.f90`, `fmin_module.f90` | quadrature (Gauss–Legendre, adaptive Gauss–Kronrod), Lagrange interpolation, minimisation |
 | `tbessk.f90`, `tbessj.f90`, `elliptic_integral.f90`, `nielsen_generalized_polylog.f90` | special functions |
 | `run90.inc` | common blocks for the beams (`ebeam`, `nuclearA_beam1/2`, `nuclearZ_beam1/2`, …), shared with the host program |
 | `banner.inc`, `generate_T*hat_WoodsSaxon_grid.inc` | banner and include files of the library |
 | `test.f90` | example program |
+| `benchmark/` | benchmark and validation drivers (not part of the library build) |
 
 ## Building
 
@@ -89,7 +90,7 @@ gfortran -I. example.f90 libgammaUPC.a -o example
 
 ## Options
 
-Set these public module variables before the first call: the grids are built on the first call and kept for the rest of the run.
+Set these public module variables before the first call. The grids are built on the first call; the new engine rebuilds them when its configuration changes.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -103,15 +104,41 @@ Set these public module variables before the first call: the grids are built on 
 | `GENERATE_DELTAB_GRID` | `.FALSE.` | tabulate the ⟨Δb⟩ numerator as well |
 | `alphaem_elasticphoton` | 1/137 | α_em of the photon fluxes |
 | `NEUTRON_XSIGMA` | `0` | shift the photo-neutron cross sections by this many standard deviations |
+| `PhotonPhotonFlux_Algorithm` | `2` | 2: kernel-factorised engine (below); 1: legacy integration |
+| `FFE_Legacy_ChFF_Definitions` | `.FALSE.` | engine only: use the legacy ChFF photon density (transverse only below 3R, point-like beyond and for x < 10⁻⁴, b ≥ 0.1R) |
+| `FFE_NodeScale` | `1` | engine only: >1 makes the quadrature denser, for convergence tests |
+| `FFE_Verbose` | `0` | engine only: >0 prints stage timings and diagnostics |
+| `FFE_Tag_Legacy` | `.FALSE.` | engine only: fill the tagging table from the legacy `Pbreak_*` functions |
 
-## Grid generation
+## Grid generation: the kernel-factorised engine
 
-With `GENERATE_PhotonPhotonFlux_GRID = .TRUE.` (the default), the first call builds the γγ flux on an 81 × 81 grid in (log₁₀ x₁, log₁₀ x₂). For Pb–Pb at 5.02 TeV this takes about 50 s with EDFF and about 9 min with ChFF (CPU, gfortran -O2), and about twice as long without optimisation. A kernel-factorised engine that builds the AB and pA grids tens to hundreds of times faster (×310 for Pb–Pb ChFF), and more precisely, is under review in [pull request #1](https://github.com/huashengshao/gamma-UPC/pull/1) (branch `faster-gammaUPC`).
+The pp, pA/Ap and AB (Woods–Saxon) fluxes and ⟨Δb⟩ are computed by default with a kernel-factorised engine (`PhotonPhotonFlux_Algorithm = 2`). The hard-sphere variants, and pp and pA with `proton_FF_correction`, keep the legacy integration.
 
-## Known issues
+**How it works.** The γγ flux is
 
-These are fixed on `faster-gammaUPC` and will reach `main` with pull request #1.
+  d²N/dx₁dx₂ = (2π α² Z₁² Z₂² / x₁x₂) ∫∫ d ln b₁ d ln b₂ W₁(x₁; b₁) W₂(x₂; b₂) Φ(b₁, b₂),
 
-- With `GENERATE_DELTAB_GRID = .TRUE.`, the ⟨Δb⟩ grids (AB, pA, pp) return an uninitialised value and index out of bounds. The default `.FALSE.` is not affected.
-- pA with ChFF in the A+p beam order (nucleus as beam 1) applies the proton and nucleus photon densities to the wrong sides.
-- The b = 0 row of the ChFF photon-density grids is left uninitialised. It is used only below b = 0.005 R.
+with W = b²N and Φ = ∫dφ P(b₁₂). The kernel Φ does not depend on x. It is integrated once per beam setup into a matrix K over Lagrange bases of fixed ln b grids. The whole grid is then Z = W₁ K W₂ᵀ, and any point off the grid costs about a millisecond. The quadrature follows the edges of the survival probability and has no truncation in b; far from the nuclei Φ comes from a moment expansion. The ChFF photon density is computed exactly in position space. The grid is stored as ln(x₁x₂Z) and read with 8 × 8 Lagrange interpolation.
+
+**Speed and precision** (CPU time of the first call, gfortran -O2):
+
+| Grid | legacy | engine |
+|---|---|---|
+| Pb–Pb 5.02 TeV, ChFF | 528 s | 1.7 s |
+| Pb–Pb 5.02 TeV, EDFF | 51 s | 0.43 s |
+| Pb–Pb ChFF with neutron tagging | 600–990 s | 4 s |
+| p–Pb 8.16 TeV, ChFF | 457 s | 1.2 s |
+| p–p 13 TeV, ChFF | 16 s | 0.44 s |
+
+Against an independent brute-force reference, the engine agrees to ≤ 10⁻⁷ for 32 configurations, pp included. The legacy integration deviates from the same reference by 0.1% to 22% (about 0.1% for pp). Grid interpolation adds ≤ 4 × 10⁻⁷.
+
+Set `PhotonPhotonFlux_Algorithm = 1` to reproduce the legacy numbers. That path includes three bug fixes: the ⟨Δb⟩ grids, pA ChFF with the nucleus as beam 1, and the b = 0 row of the ChFF density grids.
+
+## Benchmarks and validation (`benchmark/`)
+
+These programs use only the public API and link against `libgammaUPC.a`.
+
+- `bench_ab.F90` reads a namelist `/config/` (beams, flags, points file) and writes timings, flux values at chosen (x₁, x₂) points, dL/dW and ⟨Δb⟩(W) as JSON. Build it with `make -C benchmark LIBDIR=.. OUT=<dir> NEW=1`; `NEW=1` enables the engine-only switches.
+- `ref_ab.F90` is the independent reference: nested adaptive Gauss–Kronrod in (ln b₁, ln b₂, φ), with the ChFF density from the k-space integrals.
+- `bench_blocks.F90` and `test_ffe.F90` check the building blocks of the engine.
+- `unit/` holds unit tests of the quadrature, interpolation and Bessel routines. Run them with `make -C benchmark/unit`; the mpmath reference values are included.
