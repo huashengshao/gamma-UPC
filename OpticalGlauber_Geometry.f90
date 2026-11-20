@@ -1198,7 +1198,7 @@ CONTAINS
        IF(ss.GT.10d0*RR)THEN
           TAhat_WoodsSaxon=0d0
        ELSE
-          CALL SPLINE_INTERPOLATE(XA,YA,NA,ss,TAhat_WoodsSaxon)
+          CALL SPLINE_INTERPOLATE(XB,YB,NB,ss,TAhat_WoodsSaxon)
           !CALL POLYNOMINAL_INTERPOLATE(XB,YB,NB,ss,TAhat_WoodsSaxon,error)
        ENDIF
     ENDIF
