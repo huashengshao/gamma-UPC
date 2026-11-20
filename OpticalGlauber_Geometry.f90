@@ -1173,6 +1173,7 @@ CONTAINS
           DO i=1,NB
              READ(30307,*)XB(i),YB(i)
           ENDDO
+          CLOSE(UNIT=30307)
        ENDIF
        init2=1
     ENDIF
