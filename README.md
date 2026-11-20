@@ -112,7 +112,7 @@ Set these public module variables before the first call. The grids are built on 
 
 ## Grid generation: the kernel-factorised engine
 
-The AB and pA/Ap Woods–Saxon fluxes and ⟨Δb⟩ are computed by default with a kernel-factorised engine (`PhotonPhotonFlux_Algorithm = 2`). pp, the hard-sphere variants and pA with `proton_FF_correction` keep the legacy integration.
+The pp, pA/Ap and AB (Woods–Saxon) fluxes and ⟨Δb⟩ are computed by default with a kernel-factorised engine (`PhotonPhotonFlux_Algorithm = 2`). The hard-sphere variants, and pp and pA with `proton_FF_correction`, keep the legacy integration.
 
 **How it works.** The γγ flux is
 
@@ -128,8 +128,9 @@ with W = b²N and Φ = ∫dφ P(b₁₂). The kernel Φ does not depend on x. It
 | Pb–Pb 5.02 TeV, EDFF | 51 s | 0.43 s |
 | Pb–Pb ChFF with neutron tagging | 600–990 s | 4 s |
 | p–Pb 8.16 TeV, ChFF | 457 s | 1.2 s |
+| p–p 13 TeV, ChFF | 16 s | 0.44 s |
 
-Against an independent brute-force reference, the engine agrees to ≤ 10⁻⁷ for 29 configurations (pp is not covered). The legacy integration deviates from the same reference by 0.1% to 22%. Grid interpolation adds ≤ 4 × 10⁻⁷.
+Against an independent brute-force reference, the engine agrees to ≤ 10⁻⁷ for 32 configurations, pp included. The legacy integration deviates from the same reference by 0.1% to 22% (about 0.1% for pp). Grid interpolation adds ≤ 4 × 10⁻⁷.
 
 Set `PhotonPhotonFlux_Algorithm = 1` to reproduce the legacy numbers. That path includes three bug fixes: the ⟨Δb⟩ grids, pA ChFF with the nucleus as beam 1, and the b = 0 row of the ChFF density grids.
 
