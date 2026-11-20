@@ -146,6 +146,7 @@ MODULE ElasticPhotonPhotonFlux
   ! fine P table and far-zone moment tables of the kernel
   INTEGER,PARAMETER,PRIVATE::FFE_NMOM=26
   INTEGER,PRIVATE,SAVE::ffe_nf=0,ffe_ng=0,ffe_nw=0
+  REAL(KIND(1d0)),PRIVATE,SAVE::ffe_b0pp=0d0       ! pp: slope b0 (GeV^-2) of P = (1-exp(-b^2/(2 b0)))^2
   REAL(KIND(1d0)),PRIVATE,SAVE::ffe_hf=0d0,ffe_hg=0d0,ffe_hw=0d0
   REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_ht   ! tagged inner moments H_n(w)
   REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_Pf
@@ -1956,6 +1957,12 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       ! kernel-factorised engine (the correction beyond the proton dipole form factor
+       ! is only available in the legacy integration)
+       PhotonPhotonFlux_pp=ffe_api(1,x1,x2,1,force_pnohad1,GENERATE_PhotonPhotonFlux_GRID)
+       RETURN
+    ENDIF
     IF((init.EQ.0.OR.x1.LT.xmin.OR.x2.LT.xmin).AND..NOT.force_pnohad1&
          .AND.GENERATE_PhotonPhotonFlux_GRID)THEN
        ! initialisation
@@ -2178,6 +2185,12 @@ CONTAINS
        PhotonPhotonFlux_pp_eval=0d0
        RETURN
     ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       force_pnohad1=.FALSE.
+       IF(PRESENT(FORCEPNOHAD1))force_pnohad1=FORCEPNOHAD1
+       PhotonPhotonFlux_pp_eval=ffe_api(1,x1,x2,1,force_pnohad1,.FALSE.)
+       RETURN
+    ENDIF
     CALC_DELTABQ=.FALSE.
     IF(init.EQ.0)THEN
        gamma1_common=ebeam(1)/mproton
@@ -2366,6 +2379,10 @@ CONTAINS
        force_pnohad1=.FALSE.
     ELSE
        force_pnohad1=FORCEPNOHAD1
+    ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       PhotonPhotonDeltaB_pp=ffe_api(1,x1,x2,2,force_pnohad1,GENERATE_DELTAB_GRID)
+       RETURN
     ENDIF
     IF(force_pnohad1)THEN
        igrid=2
@@ -2606,6 +2623,12 @@ CONTAINS
     REAL(KIND(1d0))::cmenergy
     IF(x1.LE.0d0.OR.x1.GE.1d0.OR.x2.LE.0d0.OR.x2.GE.1d0)THEN
        PhotonPhotonDeltaB_pp_eval=0d0
+       RETURN
+    ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       force_pnohad1=.FALSE.
+       IF(PRESENT(FORCEPNOHAD1))force_pnohad1=FORCEPNOHAD1
+       PhotonPhotonDeltaB_pp_eval=ffe_api(1,x1,x2,2,force_pnohad1,.FALSE.)
        RETURN
     ENDIF
     CALC_DELTABQ=.TRUE.
@@ -10691,6 +10714,28 @@ CONTAINS
     LOGICAL::jump
     CALL ffe_gauleg(8,xg,wg)
     jump=.FALSE.
+    IF(ffe_icoll.EQ.1)THEN
+       ! pp: P = (1-exp(-u))^2, u = b^2/(2 b0), in closed form (ffe_Phad); 1-P <= 2 exp(-u) < 1e-12
+       ! beyond bcut. The ln chi table (chi = -ln P) only serves the test hooks.
+       ffe_pjump=.FALSE.
+       ffe_bcut=DSQRT(2d0*ffe_b0pp*DLOG(2d12))
+       ffe_bcut_fm=ffe_bcut*GeVm12fm
+       ffe_hb=DSQRT(ffe_b0pp)/16d0
+       ffe_nP=INT(ffe_bcut/ffe_hb)+1
+       IF(ALLOCATED(ffe_lnchi))DEALLOCATE(ffe_lnchi)
+       ALLOCATE(ffe_lnchi(ffe_nP))
+       DO i=1,ffe_nP
+          b1=ffe_Phad(DBLE(i-1)*ffe_hb)
+          IF(b1.LE.0d0)THEN
+             ffe_lnchi(i)=690d0
+          ELSE
+             ffe_lnchi(i)=DLOG(MAX(-DLOG(b1),1d-30))
+          ENDIF
+       ENDDO
+       ! breakpoint spacing: P varies on the scale sqrt(2 b0)
+       CALL ffe_build_beta(0.5d0*DSQRT(ffe_b0pp))
+       RETURN
+    ENDIF
     IF(ffe_icoll.EQ.3)THEN
        amin=MIN(ffe_bm(1)%a,ffe_bm(2)%a)
        amax=MAX(ffe_bm(1)%a,ffe_bm(2)%a)
@@ -10828,6 +10873,17 @@ CONTAINS
     REAL(KIND(1d0))::y
     IF(b.GE.ffe_bcut)THEN
        ffe_Phad=1d0
+       RETURN
+    ENDIF
+    IF(ffe_icoll.EQ.1)THEN
+       ! pp, closed form (1-exp(-u))^2 (series for small u)
+       y=0.5d0*b*b/ffe_b0pp
+       IF(y.LT.1d-3)THEN
+          y=y*(1d0-y*(0.5d0-y*(1d0/6d0-y/24d0)))
+       ELSE
+          y=1d0-DEXP(-y)
+       ENDIF
+       ffe_Phad=y*y
        RETURN
     ENDIF
     CALL ffe_lagu(b/ffe_hb,ffe_nP,p,i0,wt)
@@ -10974,6 +11030,7 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::tk
     ffe_hf=MIN(ffe_bm(1)%a,ffe_bm(2)%a)/32d0
     IF(ffe_icoll.EQ.2)ffe_hf=ffe_bm(2)%a/32d0
+    IF(ffe_icoll.EQ.1)ffe_hf=DSQRT(ffe_b0pp)/64d0
     ffe_nf=INT(ffe_bcut/ffe_hf)+8
     ! a jump at bcut: keep the stencils on the nodes below it
     IF(ffe_pjump)ffe_nf=INT(ffe_bcut/ffe_hf*(1d0-1d-12))+1
@@ -11949,6 +12006,24 @@ CONTAINS
        inuc=2
        CALL GetNuclearInfo(aname,A,Z,R,aa,w)
        CALL ffe_set_nucleus(2,A,Z,R,aa,w)
+    ELSEIF(icoll.EQ.1)THEN
+       ! pp: two protons (EDFF for b >= R_p, or the dipole charge form factor)
+       DO ib=1,2
+          ffe_bm(ib)%proton=.TRUE.
+          ffe_bm(ib)%chff=USE_CHARGEFORMFACTOR4PHOTON
+          ffe_bm(ib)%anum=1d0
+          ffe_bm(ib)%znum=1d0
+          ffe_bm(ib)%mass=mproton
+          ffe_bm(ib)%ebeam=ebeam(ib)
+          ffe_bm(ib)%gamma=ebeam(ib)/mproton
+          ffe_bm(ib)%Rfm=Rproton
+          ffe_bm(ib)%R=Rproton/GeVm12fm
+          ffe_bm(ib)%afm=0d0
+          ffe_bm(ib)%a=0d0
+          ffe_bm(ib)%w=0d0
+          ffe_bm(ib)%bmin=ffe_bm(ib)%R
+          IF(ffe_bm(ib)%chff)ffe_bm(ib)%bmin=ffe_bm(ib)%R*MERGE(0.1d0,1d-3,FFE_Legacy_ChFF_Definitions)
+       ENDDO
     ELSE
        DO ib=1,2
           IF(ib.EQ.1)THEN
@@ -11963,6 +12038,8 @@ CONTAINS
     ENDIF
     cmenergy=2d0*DSQRT(ebeam(1)*ebeam(2))
     ffe_sigNN=sigma_inelastic(cmenergy)*0.1d0/GeVm12fm**2 ! mb -> fm^2 -> GeV^-2
+    ! pp: elastic slope of the DdE fit (arXiv:2207.03012), as in PhotonPhotonFlux_pp_eval
+    ffe_b0pp=9.81d0+0.211d0*DLOG(cmenergy**2)+0.0185d0*DLOG(cmenergy**2)**2
     ! v-grids: from bmin to 45/(xmin mass) (exp(-90) of the photon density beyond)
     DO ib=1,2
        vlo=DLOG(ffe_bm(ib)%bmin)
@@ -11976,6 +12053,8 @@ CONTAINS
     ! ------------------------------------------------- kernel ingredients --
     IF(icoll.EQ.3)THEN
        ffe_tag=neutron_tagging(1).NE.-2.OR.neutron_tagging(2).NE.-2
+    ELSEIF(icoll.EQ.1)THEN
+       ffe_tag=.FALSE.
     ELSE
        IF(ffe_swap)THEN
           ffe_tag=neutron_tagging(1).NE.-2

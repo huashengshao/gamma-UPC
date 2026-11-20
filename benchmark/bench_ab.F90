@@ -13,7 +13,7 @@ PROGRAM bench_ab
   include 'run90.inc'
   ! ---------------------------------------------------------------- config --
   CHARACTER(len=200)::label='run',code_label='legacy',points_file='',out_file='bench.json'
-  INTEGER::icoll=3            ! 2 pA/Ap, 3 AB
+  INTEGER::icoll=3            ! 1 pp, 2 pA/Ap, 3 AB
   INTEGER::A1=208,Z1=82,A2=208,Z2=82
   REAL(KIND(1d0))::E1=2510d0,E2=2510d0 ! per nucleon (or proton) energies in GeV
   LOGICAL::chff=.FALSE.,conj_sum=.FALSE.,mc_glauber=.FALSE.
@@ -245,6 +245,8 @@ CONTAINS
     REAL(KIND(1d0)),INTENT(IN)::x1,x2
     IF(icoll.EQ.3)THEN
        flux_grid=PhotonPhotonFlux_AB_WoodsSaxon(x1,x2)
+    ELSEIF(icoll.EQ.1)THEN
+       flux_grid=PhotonPhotonFlux_pp(x1,x2)
     ELSE
        flux_grid=PhotonPhotonFlux_pA_WoodsSaxon(x1,x2)
     ENDIF
@@ -257,6 +259,8 @@ CONTAINS
     IF(dbpoints.AND..NOT.pnohad1)THEN
        IF(icoll.EQ.3)THEN
           flux_eval=PhotonPhotonDeltaB_AB_WoodsSaxon_eval(x1,x2)
+       ELSEIF(icoll.EQ.1)THEN
+          flux_eval=PhotonPhotonDeltaB_pp_eval(x1,x2)
        ELSE
           flux_eval=PhotonPhotonDeltaB_pA_WoodsSaxon_eval(x1,x2)
        ENDIF
@@ -264,6 +268,8 @@ CONTAINS
     ENDIF
     IF(icoll.EQ.3)THEN
        flux_eval=PhotonPhotonFlux_AB_WoodsSaxon_eval(x1,x2,pnohad1)
+    ELSEIF(icoll.EQ.1)THEN
+       flux_eval=PhotonPhotonFlux_pp_eval(x1,x2,pnohad1)
     ELSE
        flux_eval=PhotonPhotonFlux_pA_WoodsSaxon_eval(x1,x2,pnohad1)
     ENDIF

@@ -53,6 +53,7 @@ MODULE ref_state
   INTEGER::neval_tot=0,nmid=0,nmid_ier=0,nphi=0,nphi_ier=0,nu1=0
   REAL(KIND(1d0))::reltol_outer=1d-8,wn2=0d0,wn2b=0d0
   LOGICAL::debug=.FALSE.
+  REAL(KIND(1d0))::b0pp=0d0     ! pp: elastic slope (GeV^-2) of P = (1-exp(-b^2/(2 b0)))^2
   INTEGER::njump=0
   REAL(KIND(1d0)),DIMENSION(10)::bjump
   INTEGER::nf2=0
@@ -218,6 +219,7 @@ CONTAINS
     ENDDO
     nbeta=nbeta+1
     beta(nbeta)=bcut
+    IF(icoll_r.EQ.1)RETURN   ! pp: P in closed form, no table
     hb=amin/64d0
     np_t=INT(bcut/hb)+9
     IF(ALLOCATED(lnchi))DEALLOCATE(lnchi)
@@ -265,6 +267,18 @@ CONTAINS
     REAL(KIND(1d0))::Phad
     REAL(KIND(1d0)),INTENT(IN)::b
     INTEGER::i
+    REAL(KIND(1d0))::u
+    IF(icoll_r.EQ.1)THEN
+       ! pp: (1-exp(-u))^2, u = b^2/(2 b0), exact (series for small u)
+       u=0.5d0*b*b/b0pp
+       IF(u.LT.1d-3)THEN
+          u=u*(1d0-u*(0.5d0-u*(1d0/6d0-u/24d0)))
+       ELSE
+          u=1d0-DEXP(-u)
+       ENDIF
+       Phad=u*u
+       RETURN
+    ENDIF
     IF(b.GE.bcut)THEN
        Phad=1d0
        RETURN
@@ -594,6 +608,18 @@ PROGRAM ref_ab
   ! beams (engine convention for pA: beam 1 is the proton)
   swap=icoll.EQ.2.AND.nuclearA_beam1.NE.0
   DO ib=1,2
+     IF(icoll.EQ.1)THEN
+        ! pp: both beams are protons
+        isp(ib)=.TRUE.
+        AA_(ib)=1d0
+        ZZ(ib)=1d0
+        RA(ib)=0.877d0/GeVm12fm
+        mass(ib)=mproton
+        gam(ib)=ebeam(ib)/mproton
+        bmin(ib)=RA(ib)
+        IF(chff)bmin(ib)=1d-3*bmin(ib)
+        CYCLE
+     ENDIF
      IF(icoll.EQ.2.AND.ib.EQ.1)THEN
         isp(1)=.TRUE.
         AA_(1)=1d0
@@ -650,6 +676,12 @@ PROGRAM ref_ab
      ENDDO
   ENDDO
   IF(icoll.EQ.2)aa(1)=aa(2)
+  IF(icoll.EQ.1)THEN
+     ! pp: closed-form survival probability; its length scale sets the breakpoint search step
+     b0pp=9.81d0+0.211d0*DLOG(4d0*E1*E2)+0.0185d0*DLOG(4d0*E1*E2)**2
+     aa(1)=0.5d0*DSQRT(b0pp)
+     aa(2)=aa(1)
+  ENDIF
   IF(chff)THEN
      DO ib=1,2
         IF(.NOT.isp(ib))CALL build_FF(ib)
