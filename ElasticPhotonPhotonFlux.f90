@@ -10768,11 +10768,13 @@ CONTAINS
           chi(i)=ffe_sigNN*ffe_bm(1)%anum*ffe_bm(2)%anum*TAB/twopi
        ENDDO
     ENDIF
-    ! P = 1 (to 1e-14) beyond the last node with chi >= 1e-14
-    icut=0
-    DO i=nb,1,-1
-       IF(chi(i).GE.1d-12)THEN
-          icut=i
+    ! P = 1 (to 1e-12) from the first node beyond the maximum of chi where chi < 1e-12 (for w < 0
+    ! nuclei chi turns negative further out: those nodes are not kept in the table)
+    icut=nb
+    k=MAXLOC(chi(1:nb),DIM=1)
+    DO i=k,nb
+       IF(chi(i).LT.1d-12)THEN
+          icut=i-1
           EXIT
        ENDIF
     ENDDO
@@ -10798,7 +10800,7 @@ CONTAINS
        ffe_bcut=b1
        ffe_nP=icut
     ELSE
-       ffe_nP=MIN(nb,icut+5)
+       ffe_nP=icut
        ffe_bcut=bt(MIN(nb,icut+1))
     ENDIF
     ffe_bcut_fm=ffe_bcut*GeVm12fm
