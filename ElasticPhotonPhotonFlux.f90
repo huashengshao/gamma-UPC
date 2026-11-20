@@ -429,7 +429,8 @@ CONTAINS
              ENDIF
           ENDIF
           IF(XA(I).EQ.0d0)THEN
-             ZA(I,J)=0d0
+             ! b=0: the whole row vanishes (J is not the x index here)
+             ZA(I,1:NYA)=0d0
              CYCLE
           ENDIF
           DO J=1,NYA
@@ -835,7 +836,8 @@ CONTAINS
                 CALL progress(INT(I*50d0/NXA),50)
              ENDIF
              IF(XA(ibeam,I).EQ.0d0)THEN
-                ZA(ibeam,I,J)=0d0
+                ! b=0: the whole row vanishes (J is not the x index here)
+                ZA(ibeam,I,1:NYA)=0d0
                 CYCLE
              ENDIF
              DO J=1,NYA
@@ -2322,27 +2324,29 @@ CONTAINS
              WRITE(*,*)"INFO: in PhotonPhotonDeltaB_pp, the xmin of the grid has been updated to ",xmin
              ! save the values that have been calculated before
              IF(gridready(1))THEN
-                MX_save(1)=MX
-                MY_save(1)=MY
+                ! the saved grid has the size before the xmin update
+                MX_save(1)=nseg*(-log10xmin_before)
+                MY_save(1)=MX_save(1)
                 IF(ALLOCATED(ZD1_save))THEN
                    DEALLOCATE(ZD1_save)
                 ENDIF
-                ALLOCATE(ZD1_save(MX+1,MY+1))
-                DO I=1,MX+1
-                   DO J=1,MY+1
+                ALLOCATE(ZD1_save(MX_save(1)+1,MY_save(1)+1))
+                DO I=1,MX_save(1)+1
+                   DO J=1,MY_save(1)+1
                       ZD1_save(I,J)=ZD(1,I,J)
                    ENDDO
                 ENDDO
              ENDIF
              IF(gridready(2))THEN
-                MX_save(2)=MX
-                MY_save(2)=MY
+                ! the saved grid has the size before the xmin update
+                MX_save(2)=nseg*(-log10xmin_before)
+                MY_save(2)=MX_save(2)
                 IF(ALLOCATED(ZD2_save))THEN
                    DEALLOCATE(ZD2_save)
                 ENDIF
-                ALLOCATE(ZD2_save(MX+1,MY+1))
-                DO I=1,MX+1
-                   DO J=1,MY+1
+                ALLOCATE(ZD2_save(MX_save(2)+1,MY_save(2)+1))
+                DO I=1,MX_save(2)+1
+                   DO J=1,MY_save(2)+1
                       ZD2_save(I,J)=ZD(2,I,J)
                    ENDDO
                 ENDDO
@@ -2433,12 +2437,12 @@ CONTAINS
        DO I=K+1,K+nseg+1
           if(XD_1D(I).LE.XI(1))EXIT
        ENDDO
-       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX_save(igrid)+1)THEN
+       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX+1)THEN
           K=I-n_interp/2-1
        ELSEIF(I-n_interp/2.LT.1)THEN
           K=0
-       ELSEIF(I-n_interp/2-1+n_interp.GT.MX_save(igrid)+1)THEN
-          K=MX_save(igrid)+1-n_interp
+       ELSEIF(I-n_interp/2-1+n_interp.GT.MX+1)THEN
+          K=MX+1-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here #1 !"
           STOP
@@ -2447,12 +2451,12 @@ CONTAINS
        DO I=L+1,L+nseg+1
           if(YD_1D(I).LE.YI(1))EXIT
        ENDDO
-       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY_save(igrid)+1)THEN
+       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY+1)THEN
           L=I-n_interp/2-1
        ELSEIF(I-n_interp/2.LT.1)THEN
           L=0
-       ELSEIF(I-n_interp/2-1+n_interp.GT.MY_save(igrid)+1)THEN
-          L=MY_save(igrid)+1-n_interp
+       ELSEIF(I-n_interp/2-1+n_interp.GT.MY+1)THEN
+          L=MY+1-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here #2 !"
           STOP
@@ -3642,27 +3646,29 @@ CONTAINS
              WRITE(*,*)"INFO: in PhotonPhotonDeltaB_pA_WoodsSaxon, the xmin of the grid has been updated to ",xmin
              ! save the values that have been calculated before
              IF(gridready(1))THEN
-                MX_save(1)=MX
-                MY_save(1)=MY
+                ! the saved grid has the size before the xmin update
+                MX_save(1)=nseg*(-log10xmin_before)
+                MY_save(1)=MX_save(1)
                 IF(ALLOCATED(ZD1_save))THEN
                    DEALLOCATE(ZD1_save)
                 ENDIF
-                ALLOCATE(ZD1_save(MX+1,MY+1))
-                DO I=1,MX+1
-                   DO J=1,MY+1
+                ALLOCATE(ZD1_save(MX_save(1)+1,MY_save(1)+1))
+                DO I=1,MX_save(1)+1
+                   DO J=1,MY_save(1)+1
                       ZD1_save(I,J)=ZD(1,I,J)
                    ENDDO
                 ENDDO
              ENDIF
              IF(gridready(2))THEN
-                MX_save(2)=MX
-                MY_save(2)=MY
+                ! the saved grid has the size before the xmin update
+                MX_save(2)=nseg*(-log10xmin_before)
+                MY_save(2)=MX_save(2)
                 IF(ALLOCATED(ZD2_save))THEN
                    DEALLOCATE(ZD2_save)
                 ENDIF
-                ALLOCATE(ZD2_save(MX+1,MY+1))
-                DO I=1,MX+1
-                   DO J=1,MY+1
+                ALLOCATE(ZD2_save(MX_save(2)+1,MY_save(2)+1))
+                DO I=1,MX_save(2)+1
+                   DO J=1,MY_save(2)+1
                       ZD2_save(I,J)=ZD(2,I,J)
                    ENDDO
                 ENDDO
@@ -3753,12 +3759,12 @@ CONTAINS
        DO I=K+1,K+nseg+1
           if(XD_1D(I).LE.XI(1))EXIT
        ENDDO
-       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX_save(igrid)+1)THEN
+       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX+1)THEN
           K=I-n_interp/2-1
        ELSEIF(I-n_interp/2.LT.1)THEN
           K=0
-       ELSEIF(I-n_interp/2-1+n_interp.GT.MX_save(igrid)+1)THEN
-          K=MX_save(igrid)+1-n_interp
+       ELSEIF(I-n_interp/2-1+n_interp.GT.MX+1)THEN
+          K=MX+1-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here #1 !"
           STOP
@@ -3767,12 +3773,12 @@ CONTAINS
        DO I=L+1,L+nseg+1
           if(YD_1D(I).LE.YI(1))EXIT
        ENDDO
-       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY_save(igrid)+1)THEN
+       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY+1)THEN
           L=I-n_interp/2-1
        ELSEIF(I-n_interp/2.LT.1)THEN
           L=0
-       ELSEIF(I-n_interp/2-1+n_interp.GT.MY_save(igrid)+1)THEN
-          L=MY_save(igrid)+1-n_interp
+       ELSEIF(I-n_interp/2-1+n_interp.GT.MY+1)THEN
+          L=MY+1-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here #2 !"
           STOP
@@ -4064,17 +4070,12 @@ CONTAINS
        ! converting from fm to GeV-1
        RR=RA_common/GeVm12fm
        aaa=aaVal_common/GeVm12fm
-       IF(nuclearA_beam1.NE.0)THEN
-          Ngamma1=PhotonNumberDensity_ChargeFormFactor_WS(b1,E1_common,gamma1_common,&
-               RR,wVal_common,aaa,3d0,0.7d0,1)
-          Ngamma2=PhotonNumberDensity_ChargeFormFactor_proton(b2,E2_common,gamma2_common,&
-               proton_FF_correction)
-       ELSE
-          Ngamma1=PhotonNumberDensity_ChargeFormFactor_proton(b1,E1_common,gamma1_common,&
-               proton_FF_correction)
-          Ngamma2=PhotonNumberDensity_ChargeFormFactor_WS(b2,E2_common,gamma2_common,&
-               RR,wVal_common,aaa,3d0,0.7d0,2)
-       ENDIF
+       ! side 1 is always the proton and side 2 the nucleus: _eval swaps the beams for A+p
+       ! (b1 is built with mproton and E1_common from the proton beam in both orders)
+       Ngamma1=PhotonNumberDensity_ChargeFormFactor_proton(b1,E1_common,gamma1_common,&
+            proton_FF_correction)
+       Ngamma2=PhotonNumberDensity_ChargeFormFactor_WS(b2,E2_common,gamma2_common,&
+            RR,wVal_common,aaa,3d0,0.7d0,2)
     ENDIF
     PhotonPhotonFlux_pA_WoodsSaxon_fxn=b1**2*b2**2*pnohad*Ngamma1*Ngamma2
     RETURN
@@ -5033,27 +5034,29 @@ CONTAINS
              WRITE(*,*)"INFO: in PhotonPhotonDeltaB_AB_WoodsSaxon, the xmin of the grid has been updated to ",xmin
              ! save the values that have been calculated before
              IF(gridready(1))THEN
-                MX_save(1)=MX
-                MY_save(1)=MY
+                ! the saved grid has the size before the xmin update
+                MX_save(1)=nseg*(-log10xmin_before)
+                MY_save(1)=MX_save(1)
                 IF(ALLOCATED(ZD1_save))THEN
                    DEALLOCATE(ZD1_save)
                 ENDIF
-                ALLOCATE(ZD1_save(MX+1,MY+1))
-                DO I=1,MX+1
-                   DO J=1,MY+1
+                ALLOCATE(ZD1_save(MX_save(1)+1,MY_save(1)+1))
+                DO I=1,MX_save(1)+1
+                   DO J=1,MY_save(1)+1
                       ZD1_save(I,J)=ZD(1,I,J)
                    ENDDO
                 ENDDO
              ENDIF
              IF(gridready(2))THEN
-                MX_save(2)=MX
-                MY_save(2)=MY
+                ! the saved grid has the size before the xmin update
+                MX_save(2)=nseg*(-log10xmin_before)
+                MY_save(2)=MX_save(2)
                 IF(ALLOCATED(ZD2_save))THEN
                    DEALLOCATE(ZD2_save)
                 ENDIF
-                ALLOCATE(ZD2_save(MX+1,MY+1))
-                DO I=1,MX+1
-                   DO J=1,MY+1
+                ALLOCATE(ZD2_save(MX_save(2)+1,MY_save(2)+1))
+                DO I=1,MX_save(2)+1
+                   DO J=1,MY_save(2)+1
                       ZD2_save(I,J)=ZD(2,I,J)
                    ENDDO
                 ENDDO
@@ -5144,12 +5147,12 @@ CONTAINS
        DO I=K+1,K+nseg+1
           if(XD_1D(I).LE.XI(1))EXIT
        ENDDO
-       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX_save(igrid)+1)THEN
+       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX+1)THEN
           K=I-n_interp/2-1
        ELSEIF(I-n_interp/2.LT.1)THEN
           K=0
-       ELSEIF(I-n_interp/2-1+n_interp.GT.MX_save(igrid)+1)THEN
-          K=MX_save(igrid)+1-n_interp
+       ELSEIF(I-n_interp/2-1+n_interp.GT.MX+1)THEN
+          K=MX+1-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here #1 !"
           STOP
@@ -5158,12 +5161,12 @@ CONTAINS
        DO I=L+1,L+nseg+1
           if(YD_1D(I).LE.YI(1))EXIT
        ENDDO
-       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY_save(igrid)+1)THEN
+       IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY+1)THEN
           L=I-n_interp/2-1
        ELSEIF(I-n_interp/2.LT.1)THEN
           L=0
-       ELSEIF(I-n_interp/2-1+n_interp.GT.MY_save(igrid)+1)THEN
-          L=MY_save(igrid)+1-n_interp
+       ELSEIF(I-n_interp/2-1+n_interp.GT.MY+1)THEN
+          L=MY+1-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here #2 !"
           STOP
@@ -5182,7 +5185,7 @@ CONTAINS
        IF(ISNAN(ZI(1)).OR.ZI(1).LT.0d0)THEN
           PhotonPhotonDeltaB_AB_WoodsSaxon=0d0
        ELSE
-          PhotonPhotonDeltaB_AB_WoodsSaxon=pnohadval
+          PhotonPhotonDeltaB_AB_WoodsSaxon=ZI(1)
        ENDIF
     ELSE
        PhotonPhotonDeltaB_AB_WoodsSaxon=PhotonPhotonDeltaB_AB_WoodsSaxon_eval(x1,x2,force_pnohad1)
