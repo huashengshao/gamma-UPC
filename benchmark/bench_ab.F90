@@ -33,10 +33,12 @@ PROGRAM bench_ab
   LOGICAL::legacy_defs=.FALSE. ! new code only: FFE_Legacy_ChFF_Definitions
   REAL(KIND(1d0))::node_scale=1d0 ! new code only: FFE_NodeScale (convergence studies)
   INTEGER::verbose=0           ! new code only: FFE_Verbose (stage timings)
+  LOGICAL::grid_cache=.FALSE.  ! new code only: FFE_Grid_Cache
+  CHARACTER(len=400)::grid_cache_dir='./' ! new code only: FFE_Grid_Cache_Dir
   NAMELIST /config/ label,code_label,points_file,out_file,icoll,A1,Z1,A2,Z2,E1,E2,chff,&
        conj_sum,mc_glauber,tag1,tag2,iepsilon,do_grid,do_eval,do_pnohad1,eval_kinds,&
        nlookup,nW,Wmin,Wmax,nWdb,Wdbmin,Wdbmax,algorithm,deltab_grid,dbpoints,legacy_defs,&
-       node_scale,verbose
+       node_scale,verbose,grid_cache,grid_cache_dir
   ! ----------------------------------------------------------------- state --
   CHARACTER(len=400)::arg
   INTEGER::iu,ios,np,i,kind_i
@@ -90,6 +92,8 @@ PROGRAM bench_ab
   FFE_Legacy_ChFF_Definitions=legacy_defs
   FFE_NodeScale=node_scale
   FFE_Verbose=verbose
+  FFE_Grid_Cache=grid_cache
+  FFE_Grid_Cache_Dir=grid_cache_dir
 #endif
 
   ! points

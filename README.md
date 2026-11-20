@@ -109,6 +109,8 @@ Set these public module variables before the first call. The grids are built on 
 | `FFE_NodeScale` | `1` | engine only: >1 makes the quadrature denser, for convergence tests |
 | `FFE_Verbose` | `0` | engine only: >0 prints stage timings and diagnostics |
 | `FFE_Tag_Legacy` | `.FALSE.` | engine only: fill the tagging table from the legacy `Pbreak_*` functions |
+| `FFE_Grid_Cache` | `.FALSE.` | engine only: share the final grids between processes through files (below) |
+| `FFE_Grid_Cache_Dir` | `'./'` | engine only: directory of the grid cache files |
 
 ## Grid generation: the kernel-factorised engine
 
@@ -131,6 +133,8 @@ with W = b²N and Φ = ∫dφ P(b₁₂). The kernel Φ does not depend on x. It
 | p–p 13 TeV, ChFF | 16 s | 0.44 s |
 
 Against an independent brute-force reference, the engine agrees to ≤ 10⁻⁷ for 32 configurations, pp included. The legacy integration deviates from the same reference by 0.1% to 22% (about 0.1% for pp). Grid interpolation adds ≤ 4 × 10⁻⁷.
+
+**Grid cache.** With `FFE_Grid_Cache = .TRUE.`, the first process that needs a grid writes it to `FFE_Grid_Cache_Dir`, as `gammaUPC_grid_<key>_k<kind>.bin` (about 0.6 MB). The key is a hash of the whole configuration, and other processes with the same configuration read the file instead of rebuilding: under a millisecond instead of 0.3–6 s. While one process builds, the others wait for its file; a lock directory left by a killed process is ignored after 300 s. Files are written under a temporary name and renamed, checked against the configuration and a checksum when read, and rebuilt when they do not match. MadGraph turns the cache on for its jobs. Delete the files after changing the gamma-UPC source code.
 
 Set `PhotonPhotonFlux_Algorithm = 1` to reproduce the legacy numbers. That path includes three bug fixes: the ⟨Δb⟩ grids, pA ChFF with the nucleus as beam 1, and the b = 0 row of the ChFF density grids.
 
