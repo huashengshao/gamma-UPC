@@ -72,7 +72,8 @@ MODULE ElasticPhotonPhotonFlux
   ! K (Phi integrated against Lagrange basis functions of fixed 1D grids in ln b):
   ! Z = W1 K W2^T. See ../faster-gammaUPC/PLAN.md and docs/benchmark.pdf.
   ! ---------------------------------------------------------------------------
-  INTEGER,PUBLIC::PhotonPhotonFlux_Algorithm=1 ! 1: legacy integration; 2: kernel-factorised engine
+  ! AB and pA Woods-Saxon fluxes and <Delta b> (not pp, hard sphere, or pA with proton_FF_correction):
+  INTEGER,PUBLIC::PhotonPhotonFlux_Algorithm=2 ! 2 (default): kernel-factorised engine; 1: legacy integration
   LOGICAL,PUBLIC::FFE_Legacy_ChFF_Definitions=.FALSE. ! emulate the legacy ChFF photon density
                                                ! (transverse only for b<3R, EPA beyond, b>=0.1R)
   REAL(KIND(1d0)),PUBLIC::FFE_NodeScale=1d0    ! >1: denser quadrature (convergence tests)
