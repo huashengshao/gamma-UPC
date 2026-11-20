@@ -254,18 +254,18 @@ CONTAINS
   END FUNCTION flux_eval
 
   FUNCTION jnum(v)
-    CHARACTER(len=32)::jnum
+    CHARACTER(len=34)::jnum
     REAL(KIND(1d0)),INTENT(IN)::v
     IF(v.NE.v.OR.ABS(v).GT.HUGE(v))THEN
        jnum='null'
     ELSE
-       WRITE(jnum,'(ES25.17)')v
+       WRITE(jnum,'(ES26.17E3)')v
        jnum=ADJUSTL(jnum)
     ENDIF
   END FUNCTION jnum
 
   FUNCTION jopt(v,have)
-    CHARACTER(len=32)::jopt
+    CHARACTER(len=34)::jopt
     REAL(KIND(1d0)),INTENT(IN)::v
     LOGICAL,INTENT(IN)::have
     IF(have)THEN
