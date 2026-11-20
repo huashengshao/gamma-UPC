@@ -671,6 +671,12 @@ PROGRAM ref_ab
      DO i=1,nT
         Ptab(i)=FFE_Test_Value(5,icoll,1d-3,DEXP(Tv0+DBLE(i-1)*Th))
      ENDDO
+     ! the tagging factor is long-range: geometric breakpoints bcut 2^k beyond bcut (u2 and phi)
+     DO k=1,60
+        IF(nbeta.GE.200.OR.bcut*2d0**k.GT.1d12)EXIT
+        nbeta=nbeta+1
+        beta(nbeta)=bcut*2d0**k
+     ENDDO
   ENDIF
   ! points
   np=0
