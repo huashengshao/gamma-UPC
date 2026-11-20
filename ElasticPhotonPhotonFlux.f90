@@ -120,6 +120,9 @@ MODULE ElasticPhotonPhotonFlux
   INTEGER,PRIVATE,SAVE::ffe_nT=0
   REAL(KIND(1d0)),PRIVATE,SAVE::ffe_Tv0=0d0,ffe_Th=0d0
   REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_PtagT
+  INTEGER,PRIVATE,SAVE::ffe_nTF=0
+  REAL(KIND(1d0)),PRIVATE,SAVE::ffe_ThF=0d0
+  REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_PtagF
   ! kernel breakpoints (GeV^-1)
   INTEGER,PRIVATE,SAVE::ffe_nbeta=0
   REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_beta
@@ -141,8 +144,9 @@ MODULE ElasticPhotonPhotonFlux
   REAL(KIND(1d0)),DIMENSION(6),PRIVATE,SAVE::ffe_time=0d0         ! setup, W, P, K, grid, total (CPU s)
   ! fine P table and far-zone moment tables of the kernel
   INTEGER,PARAMETER,PRIVATE::FFE_NMOM=26
-  INTEGER,PRIVATE,SAVE::ffe_nf=0,ffe_ng=0
-  REAL(KIND(1d0)),PRIVATE,SAVE::ffe_hf=0d0,ffe_hg=0d0
+  INTEGER,PRIVATE,SAVE::ffe_nf=0,ffe_ng=0,ffe_nw=0
+  REAL(KIND(1d0)),PRIVATE,SAVE::ffe_hf=0d0,ffe_hg=0d0,ffe_hw=0d0
+  REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_ht   ! tagged inner moments H_n(w)
   REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::ffe_Pf
   REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_gt
   ! near-zone node pool (v1, v2, c1..c3) used while the s-adaptation runs
@@ -10432,7 +10436,7 @@ CONTAINS
     ! weight*2*rho(sqrt(s^2+z^2)) and the z-moments of the cos(qz) expansion
     IMPLICIT NONE
     INTEGER,INTENT(IN)::ib
-    INTEGER,PARAMETER::nsg=4,nzg=4,nmom=12
+    INTEGER,PARAMETER::nsg=4,nzg=6,nmom=12
     INTEGER::nr,np,npts,i,j,k,g,is,nz,cnt,lo,hi,mid
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::rb,pk,zb
     REAL(KIND(1d0))::smax,s,z0,z1,zz,hh,cc
@@ -10834,23 +10838,59 @@ CONTAINS
     ENDIF
   END FUNCTION ffe_Phad
 
-  FUNCTION ffe_Ptag(b)
-    ! neutron-tagging probability at impact parameter b (GeV^-1), from its ln b table
+  FUNCTION ffe_Ptag8(b)
+    ! neutron-tagging probability at impact parameter b (GeV^-1), 8-point Lagrange on its ln b table
     IMPLICIT NONE
-    REAL(KIND(1d0))::ffe_Ptag
+    REAL(KIND(1d0))::ffe_Ptag8
     REAL(KIND(1d0)),INTENT(IN)::b
     INTEGER,PARAMETER::p=8
     REAL(KIND(1d0)),DIMENSION(p)::wt
     INTEGER::i0
     REAL(KIND(1d0))::u
+    u=(DLOG(b)-ffe_Tv0)/ffe_Th
+    u=MAX(0d0,MIN(u,DBLE(ffe_nT-1)))
+    CALL ffe_lagu(u,ffe_nT,p,i0,wt)
+    ffe_Ptag8=SUM(wt*ffe_PtagT(i0+1:i0+p))
+  END FUNCTION ffe_Ptag8
+
+  SUBROUTINE ffe_build_tagfine()
+    ! the 8-point interpolant of the P_tag table sampled 4x finer, for the 6-point lookups of
+    ! ffe_Ptag inside the kernel (the general 8-point weights dominated the tagged K build)
+    IMPLICIT NONE
+    INTEGER::i
+    ffe_ThF=0.25d0*ffe_Th
+    ffe_nTF=4*(ffe_nT-1)+1
+    IF(ALLOCATED(ffe_PtagF))DEALLOCATE(ffe_PtagF)
+    ALLOCATE(ffe_PtagF(ffe_nTF))
+    DO i=1,ffe_nTF
+       ffe_PtagF(i)=ffe_Ptag8(DEXP(ffe_Tv0+DBLE(i-1)*ffe_ThF))
+    ENDDO
+  END SUBROUTINE ffe_build_tagfine
+
+  FUNCTION ffe_Ptag(b)
+    ! neutron-tagging probability at impact parameter b (GeV^-1): 6-point Lagrange on the fine
+    ! ln b table (constant beyond its ends)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::ffe_Ptag
+    REAL(KIND(1d0)),INTENT(IN)::b
+    REAL(KIND(1d0))::u,x0,x1,x2,x3,x4,x5
+    INTEGER::i0
     IF(.NOT.ffe_tag)THEN
        ffe_Ptag=1d0
        RETURN
     ENDIF
-    u=(DLOG(b)-ffe_Tv0)/ffe_Th
-    u=MAX(0d0,MIN(u,DBLE(ffe_nT-1)))
-    CALL ffe_lagu(u,ffe_nT,p,i0,wt)
-    ffe_Ptag=SUM(wt*ffe_PtagT(i0+1:i0+p))
+    u=(DLOG(b)-ffe_Tv0)/ffe_ThF
+    u=MAX(0d0,MIN(u,DBLE(ffe_nTF-1)))
+    i0=MAX(0,MIN(INT(u)-2,ffe_nTF-6))
+    x0=u-DBLE(i0)
+    x1=x0-1d0
+    x2=x0-2d0
+    x3=x0-3d0
+    x4=x0-4d0
+    x5=x0-5d0
+    ffe_Ptag=-ffe_PtagF(i0+1)*x1*x2*x3*x4*x5/120d0+ffe_PtagF(i0+2)*x0*x2*x3*x4*x5/24d0&
+         -ffe_PtagF(i0+3)*x0*x1*x3*x4*x5/12d0+ffe_PtagF(i0+4)*x0*x1*x2*x4*x5/12d0&
+         -ffe_PtagF(i0+5)*x0*x1*x2*x3*x5/24d0+ffe_PtagF(i0+6)*x0*x1*x2*x3*x4/120d0
   END FUNCTION ffe_Ptag
 
   SUBROUTINE ffe_build_beta(amin)
@@ -10911,7 +10951,7 @@ CONTAINS
        dmax=DEXP(ffe_vg(1)%v(ffe_vg(1)%n))+DEXP(ffe_vg(2)%v(ffe_vg(2)%n))
        bm=ffe_bcut
        DO WHILE(bm.LT.dmax.AND.n.LT.nmax)
-          bm=bm*1.4d0
+          bm=bm*2d0
           n=n+1
           bb(n)=bm
        ENDDO
@@ -10928,7 +10968,7 @@ CONTAINS
     ! far-zone expansion Phi = 2pi - (2/sqrt(G)) sum_n c_n g_2n(|d|)/(4G)^n, G = b1 b2 >= bcut^2
     IMPLICIT NONE
     INTEGER::i,k,n,np,g,m
-    REAL(KIND(1d0))::d,tb,t0,t1,hh,cc,tau,b12,om,pw
+    REAL(KIND(1d0))::d,tb,t0,t1,hh,cc,tau,b12,om,pw,wv
     REAL(KIND(1d0)),DIMENSION(8)::xg,wg
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::tk
     ffe_hf=MIN(ffe_bm(1)%a,ffe_bm(2)%a)/32d0
@@ -10945,7 +10985,7 @@ CONTAINS
     ffe_hg=ffe_hf*2d0
     ffe_ng=INT(ffe_bcut/ffe_hg)+8
     IF(ALLOCATED(ffe_gt))DEALLOCATE(ffe_gt)
-    ALLOCATE(ffe_gt(0:FFE_NMOM,ffe_ng,2),tk(ffe_nbeta+2))
+    ALLOCATE(ffe_gt(0:FFE_NMOM,ffe_ng,2),tk(ffe_nbeta+3))
     CALL ffe_gauleg(8,xg,wg)
     ffe_gt=0d0
     DO i=1,ffe_ng
@@ -10978,6 +11018,50 @@ CONTAINS
           ENDDO
        ENDDO
     ENDDO
+    ! tagging: inner moments h_2n(d) = int_0^tauB tau^2n P_had P_tag (b12 < bcut) [* b12 in fm];
+    ! h_2n = tauB^(2n+1) H_n(w), w = tauB^2 = bcut^2 - d^2, with H_n = int_0^1 sigma^2n P(b12) dsigma,
+    ! b12^2 = d^2 + w sigma^2, smooth in w (the edge P(bcut) P_tag(bcut) /= 0 is in tauB^(2n+1))
+    IF(ffe_tag)THEN
+       ! w in [0, bcut^2] (the stencils are one-sided at the ends)
+       ffe_nw=INT(ffe_bcut/ffe_hg)+1
+       ffe_hw=ffe_bcut**2/DBLE(ffe_nw-1)
+       IF(ALLOCATED(ffe_ht))DEALLOCATE(ffe_ht)
+       ALLOCATE(ffe_ht(0:FFE_NMOM,ffe_nw,2))
+       ffe_ht=0d0
+       DO i=1,ffe_nw
+          wv=MIN(DBLE(i-1)*ffe_hw,ffe_bcut**2)
+          d=DSQRT(MAX(0d0,ffe_bcut**2-wv))
+          tb=DSQRT(wv)
+          np=0
+          IF(tb.GT.0d0)THEN
+             DO k=1,ffe_nbeta
+                IF(ffe_beta(k).GT.d.AND.ffe_beta(k).LT.ffe_bcut)THEN
+                   np=np+1
+                   tk(np)=DSQRT((ffe_beta(k)-d)*(ffe_beta(k)+d))/tb
+                ENDIF
+             ENDDO
+          ENDIF
+          CALL ffe_breaks(np,tk,0d0,1d0,1d-12,n)
+          DO k=1,n-1
+             t0=tk(k)
+             t1=tk(k+1)
+             hh=0.5d0*(t1-t0)
+             cc=0.5d0*(t1+t0)
+             DO g=1,8
+                tau=cc+hh*xg(g)
+                b12=DSQRT(d*d+wv*tau*tau)
+                om=ffe_Pfast(b12)
+                IF(om.GT.0d0)om=om*ffe_Ptag(b12)
+                pw=hh*wg(g)*om
+                DO m=0,FFE_NMOM
+                   ffe_ht(m,i,1)=ffe_ht(m,i,1)+pw
+                   ffe_ht(m,i,2)=ffe_ht(m,i,2)+pw*b12*GeVm12fm
+                   pw=pw*tau*tau
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDIF
     DEALLOCATE(tk)
   END SUBROUTINE ffe_build_pfast
 
@@ -11032,10 +11116,11 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     INTEGER,PARAMETER::ng=4
     REAL(KIND(1d0)),DIMENSION(ng)::xg,wg
+    REAL(KIND(1d0)),DIMENSION(8)::xt,wtt
     REAL(KIND(1d0)),DIMENSION(16)::xl,wl
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,SAVE::ph
     INTEGER::i,np,ig,m,i0
-    REAL(KIND(1d0))::Gp,G4,ad,Dsum,hh,cc,b12,sn,pp,s1,s2,arg,pd1,y,cn,sum1,sum2,u
+    REAL(KIND(1d0))::Gp,G4,ad,Dsum,hh,cc,b12,sn,pp,s1,s2,arg,pd1,y,cn,sum1,sum2,u,wv,php
     REAL(KIND(1d0)),DIMENSION(8)::wt
     LOGICAL::longtail
     IF(.NOT.ALLOCATED(ph))ALLOCATE(ph(5000))
@@ -11076,6 +11161,58 @@ CONTAINS
           RETURN
        ENDIF
     ENDIF
+    CALL ffe_gauleg(8,xt,wtt)
+    IF(longtail.AND.Gp.GE.ffe_bcut**2)THEN
+       ! far zone with tagging: the arc b12 < bcut from the inner moments (expansion in
+       ! tau^2/(4G) <= 1/4), the rest (P = P_tag) by 8-point panels between the tagging ladder
+       sum1=0d0
+       sum2=0d0
+       php=0d0
+       IF(ad.LT.ffe_bcut)THEN
+          wv=(ffe_bcut-ad)*(ffe_bcut+ad)
+          u=wv/ffe_hw
+          CALL ffe_lagu(u,ffe_nw,8,i0,wt)
+          y=wv/G4
+          cn=1d0
+          DO m=0,FFE_NMOM
+             sum1=sum1+cn*SUM(wt*ffe_ht(m,i0+1:i0+8,1))
+             IF(nk.GE.2)sum2=sum2+cn*SUM(wt*ffe_ht(m,i0+1:i0+8,2))
+             cn=cn*y*DBLE(2*m+1)/DBLE(2*m+2)
+          ENDDO
+          sum1=sum1*DSQRT(wv)
+          sum2=sum2*DSQRT(wv)
+          php=2d0*DASIN(MIN(1d0,DSQRT(wv/G4)))
+       ENDIF
+       np=1
+       ph(1)=php
+       DO i=1,ffe_nbeta
+          IF(ffe_beta(i).LE.ffe_bcut*(1d0+1d-12).OR.ffe_beta(i).LE.ad)CYCLE
+          IF(ffe_beta(i).GE.Dsum)EXIT
+          arg=(ffe_beta(i)-ad)*(ffe_beta(i)+ad)/G4
+          IF(arg.GE.1d0)EXIT
+          np=np+1
+          ph(np)=2d0*DASIN(DSQRT(arg))
+       ENDDO
+       np=np+1
+       ph(np)=pi
+       s1=0d0
+       s2=0d0
+       DO i=1,np-1
+          IF(ph(i+1).LE.ph(i))CYCLE
+          hh=0.5d0*(ph(i+1)-ph(i))
+          cc=0.5d0*(ph(i+1)+ph(i))
+          DO ig=1,8
+             sn=DSIN(0.5d0*(cc+hh*xt(ig)))
+             b12=DSQRT(d*d+G4*sn*sn)
+             pp=ffe_Ptag(b12)
+             s1=s1+hh*wtt(ig)*pp
+             IF(nk.GE.2)s2=s2+hh*wtt(ig)*pp*b12
+          ENDDO
+       ENDDO
+       phi(1)=2d0*s1+2d0*sum1/DSQRT(Gp)
+       IF(nk.GE.2)phi(2)=2d0*s2*GeVm12fm+2d0*sum2/DSQRT(Gp)
+       RETURN
+    ENDIF
     CALL ffe_gauleg(ng,xg,wg)
     CALL ffe_gauleg(16,xl,wl)
     np=1
@@ -11110,11 +11247,26 @@ CONTAINS
              CYCLE
           ENDIF
        ENDIF
+       IF(longtail)THEN
+          sn=DSIN(0.5d0*ph(i))
+          IF(d*d+G4*sn*sn.GE.ffe_bcut**2*(1d0-1d-14))THEN
+             ! tagging tail beyond bcut (panels between the geometric beta, ratio 2): 8 nodes,
+             ! 4 leave -7e-7 in the XnXn flux
+             DO ig=1,8
+                sn=DSIN(0.5d0*(cc+hh*xt(ig)))
+                b12=DSQRT(d*d+G4*sn*sn)
+                pp=ffe_Ptag(b12)
+                s1=s1+hh*wtt(ig)*pp
+                IF(nk.GE.2)s2=s2+hh*wtt(ig)*pp*b12
+             ENDDO
+             CYCLE
+          ENDIF
+       ENDIF
        DO ig=1,ng
           sn=DSIN(0.5d0*(cc+hh*xg(ig)))
           b12=DSQRT(d*d+G4*sn*sn)
           pp=ffe_Pfast(b12)
-          IF(ffe_tag)pp=pp*ffe_Ptag(b12)
+          IF(ffe_tag.AND.pp.GT.0d0)pp=pp*ffe_Ptag(b12)
           s1=s1+hh*wg(ig)*pp
           IF(nk.GE.2)s2=s2+hh*wg(ig)*pp*b12
        ENDDO
@@ -11831,7 +11983,10 @@ CONTAINS
        ENDIF
     ENDIF
     CALL ffe_build_ptable()
-    IF(ffe_tag)CALL ffe_build_tagtable()
+    IF(ffe_tag)THEN
+       CALL ffe_build_tagtable()
+       CALL ffe_build_tagfine()
+    ENDIF
     CALL ffe_build_pfast()
     CALL CPU_TIME(t1)
     ffe_time(2)=t1-t0
