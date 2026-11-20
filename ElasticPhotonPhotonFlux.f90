@@ -127,7 +127,7 @@ MODULE ElasticPhotonPhotonFlux
   ! kernel matrices: 1 flux, 2 <Delta b> numerator (fm), 3 <Delta b> numerator with PNOHAD=1 (fm)
   REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE,PRIVATE,SAVE::ffe_K
   LOGICAL,DIMENSION(3),PRIVATE,SAVE::ffe_Kready=.FALSE.
-  INTEGER,PRIVATE,SAVE::ffe_nodes=0
+  INTEGER,PRIVATE,SAVE::ffe_nodes=0,ffe_nguard=0
   ! grids in log10 x: node i <-> log10 x = -(i-1)/ffe_nseg, i = 1..ffe_MX+1
   INTEGER,PARAMETER,PRIVATE::ffe_nseg=20
   INTEGER,PRIVATE,SAVE::ffe_MX=0
@@ -3238,6 +3238,12 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       ! kernel-factorised engine (the correction beyond the proton dipole form factor
+       ! is only available in the legacy integration)
+       PhotonPhotonFlux_pA_WoodsSaxon=ffe_api(2,x1,x2,1,force_pnohad1,GENERATE_PhotonPhotonFlux_GRID)
+       RETURN
+    ENDIF
     IF((init.EQ.0.OR.x1.LT.xmin.OR.x2.LT.xmin).AND..NOT.force_pnohad1&
          .AND.GENERATE_PhotonPhotonFlux_GRID)THEN
        ! initialisation
@@ -3536,6 +3542,12 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       ! kernel-factorised engine (the correction beyond the proton dipole form factor
+       ! is only available in the legacy integration)
+       PhotonPhotonFlux_pA_WoodsSaxon_eval=ffe_api(2,x1,x2,1,force_pnohad1,.FALSE.)
+       RETURN
+    ENDIF
     IF(force_pnohad1)THEN
        ! we only use PNOHAD=1
        IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
@@ -3682,6 +3694,12 @@ CONTAINS
        force_pnohad1=.FALSE.
     ELSE
        force_pnohad1=FORCEPNOHAD1
+    ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       ! kernel-factorised engine (the correction beyond the proton dipole form factor
+       ! is only available in the legacy integration)
+       PhotonPhotonDeltaB_pA_WoodsSaxon=ffe_api(2,x1,x2,2,force_pnohad1,GENERATE_DELTAB_GRID)
+       RETURN
     ENDIF
     IF(force_pnohad1)THEN
        igrid=2
@@ -4006,6 +4024,12 @@ CONTAINS
        force_pnohad1=.FALSE.
     ELSE
        force_pnohad1=FORCEPNOHAD1
+    ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2.AND..NOT.proton_FF_correction)THEN
+       ! kernel-factorised engine (the correction beyond the proton dipole form factor
+       ! is only available in the legacy integration)
+       PhotonPhotonDeltaB_pA_WoodsSaxon_eval=ffe_api(2,x1,x2,2,force_pnohad1,.FALSE.)
+       RETURN
     ENDIF
     ! we should choose the lower limit dynamically
     ! b1*x1*mproton = Exp(bA(1))
@@ -4614,6 +4638,11 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2)THEN
+       ! kernel-factorised engine (see the FFE section at the end of this module)
+       PhotonPhotonFlux_AB_WoodsSaxon=ffe_api(3,x1,x2,1,force_pnohad1,GENERATE_PhotonPhotonFlux_GRID)
+       RETURN
+    ENDIF
     IF((init.EQ.0.OR.x1.LT.xmin.OR.x2.LT.xmin).AND..NOT.force_pnohad1&
          .AND.GENERATE_PhotonPhotonFlux_GRID)THEN
        ! initialisation
@@ -4918,6 +4947,11 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2)THEN
+       ! kernel-factorised engine (see the FFE section at the end of this module)
+       PhotonPhotonFlux_AB_WoodsSaxon_eval=ffe_api(3,x1,x2,1,force_pnohad1,.FALSE.)
+       RETURN
+    ENDIF
     IF(force_pnohad1)THEN
        ! we only use PNOHAD=1
        IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
@@ -5065,6 +5099,11 @@ CONTAINS
        force_pnohad1=.FALSE.
     ELSE
        force_pnohad1=FORCEPNOHAD1
+    ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2)THEN
+       ! kernel-factorised engine (see the FFE section at the end of this module)
+       PhotonPhotonDeltaB_AB_WoodsSaxon=ffe_api(3,x1,x2,2,force_pnohad1,GENERATE_DELTAB_GRID)
+       RETURN
     ENDIF
     IF(.NOT.PRESENT(FORCEPNOHAD1))THEN
        force_pnohad1=.FALSE.
@@ -5392,6 +5431,11 @@ CONTAINS
        force_pnohad1=.FALSE.
     ELSE
        force_pnohad1=FORCEPNOHAD1
+    ENDIF
+    IF(PhotonPhotonFlux_Algorithm.EQ.2)THEN
+       ! kernel-factorised engine (see the FFE section at the end of this module)
+       PhotonPhotonDeltaB_AB_WoodsSaxon_eval=ffe_api(3,x1,x2,2,force_pnohad1,.FALSE.)
+       RETURN
     ENDIF
     ! we should choose the lower limit dynamically
     ! b1*x1*mN = Exp(bA(1)) = b1*E_gamma1/gamma1 = b1tilde
@@ -11452,8 +11496,8 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::twopi=6.28318530717958647692528676656d0
     IF(.NOT.ffe_Kready(k))CALL ffe_build_K(k)
     ALLOCATE(T(ffe_MX+1,ffe_vg(2)%n),S(ffe_MX+1,ffe_MX+1))
-    T=MATMUL(ffe_W(:,:,1),ffe_K(:,:,k))
-    S=MATMUL(T,TRANSPOSE(ffe_W(:,:,2)))
+    T=MATMUL(ffe_W(:,1:ffe_vg(1)%n,1),ffe_K(:,:,k))
+    S=MATMUL(T,TRANSPOSE(ffe_W(:,1:ffe_vg(2)%n,2)))
     pref=twopi*ffe_alpha**2*ffe_bm(1)%znum**2*ffe_bm(2)%znum**2
     IF(.NOT.ALLOCATED(ffe_ZL))ALLOCATE(ffe_ZL(ffe_MX+1,ffe_MX+1,3))
     DO j=1,ffe_MX+1
@@ -12128,5 +12172,38 @@ CONTAINS
        FFE_Test_Value=0d0
     END SELECT
   END FUNCTION FFE_Test_Value
+
+
+  FUNCTION ffe_api(icoll,x1,x2,knd,force,grid)
+    ! dispatch of the public flux and <Delta b> functions to the engine
+    ! knd 1: flux (force: PNOHAD=1 flux); knd 2: <Delta b> numerator in fm (force: PNOHAD=1)
+    ! grid: interpolate the x grid (else evaluate directly)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::ffe_api
+    INTEGER,INTENT(IN)::icoll,knd
+    REAL(KIND(1d0)),INTENT(IN)::x1,x2
+    LOGICAL,INTENT(IN)::force,grid
+    REAL(KIND(1d0))::v,p1
+    ffe_api=0d0
+    IF(x1.LE.0d0.OR.x2.LE.0d0.OR.x1.GE.1d0.OR.x2.GE.1d0)RETURN
+    IF(knd.EQ.1)THEN
+       IF(force)THEN
+          ffe_api=ffe_flux(icoll,x1,x2,1,MERGE(2,3,grid))
+       ELSEIF(grid)THEN
+          v=ffe_flux(icoll,x1,x2,1,0)
+          p1=ffe_flux(icoll,x1,x2,1,2)
+          IF(v.NE.v.OR.v.LT.0d0.OR.v.GT.1d2*p1)THEN
+             ! last-resort guard, as in the legacy code (counted in FFE_Info)
+             ffe_nguard=ffe_nguard+1
+             v=p1
+          ENDIF
+          ffe_api=v
+       ELSE
+          ffe_api=ffe_flux(icoll,x1,x2,1,1)
+       ENDIF
+    ELSE
+       ffe_api=ffe_flux(icoll,x1,x2,MERGE(3,2,force),MERGE(0,1,grid))
+    ENDIF
+  END FUNCTION ffe_api
 
 END MODULE ElasticPhotonPhotonFlux

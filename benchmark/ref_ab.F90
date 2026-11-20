@@ -13,7 +13,7 @@
 !  * the flux: nested globally adaptive Gauss-Kronrod 10/21 (gk21_adapt) in (ln b1, ln b2, phi),
 !    with breakpoints where |b1-b2| or b1+b2 crosses the edge of P (the engine uses a fixed
 !    two-dimensional rule in rotated logarithms and an x-independent kernel matrix).
-! Neutron tagging uses the legacy Pbreak functions (as the interim engine does).
+! Neutron tagging uses the engine's P_tag table (validated separately).
 MODULE ref_state
   IMPLICIT NONE
   REAL(KIND(1d0)),PARAMETER::GeVm12fm=0.1973d0,mN=0.9315d0,mproton=0.938272081d0
@@ -499,7 +499,8 @@ PROGRAM ref_ab
   neutron_conj_sum=conj_sum
   USE_CHARGEFORMFACTOR4PHOTON=chff
   alpha=0.0072992700729927005d0
-  IF(mc_glauber)STOP "ref_ab: MC-Glauber not supported"
+  use_MC_Glauber=mc_glauber
+  IEPSILON_EDFF=iepsilon
   IF(icoll.NE.3)STOP "ref_ab: pA reference not implemented yet"
   ! beams
   DO ib=1,2
@@ -546,15 +547,15 @@ PROGRAM ref_ab
   CALL build_P()
   CALL CPU_TIME(t1)
   WRITE(*,*)"REF: P table built in [s]",t1-t0,", bcut [fm] =",bcut*GeVm12fm
-  ! tagging table from the legacy functions
+  ! tagging: the engine's P_tag (validated separately: m_k against adaptive integration, row A_pbreak)
   tag=tag1.NE.-2.OR.tag2.NE.-2
   IF(tag)THEN
      Th=0.01d0
-     Tv0=DLOG(0.01d0/GeVm12fm)
+     Tv0=DLOG(0.5d0/GeVm12fm)
      nT=INT((DLOG(1d12)-Tv0)/Th)+2
      ALLOCATE(Ptab(nT))
      DO i=1,nT
-        Ptab(i)=Pbreak_AB_WoodsSaxon(tag1,tag2,DEXP(Tv0+DBLE(i-1)*Th),conj_sum)
+        Ptab(i)=FFE_Test_Value(5,icoll,1d-3,DEXP(Tv0+DBLE(i-1)*Th))
      ENDDO
   ENDIF
   ! points
