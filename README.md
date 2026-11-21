@@ -1,6 +1,6 @@
 # gamma-UPC
 
-A Fortran library for exclusive photon–photon (γγ) processes in ultraperipheral collisions (UPCs) of protons and nuclei, with realistic photon fluxes (version 1.8).
+A Fortran library for exclusive photon–photon (γγ) processes in ultraperipheral collisions (UPCs) of protons and nuclei, with realistic photon fluxes (version 2.0).
 
 By Hua-Sheng Shao (LPTHE) and David d'Enterria (CERN).
 

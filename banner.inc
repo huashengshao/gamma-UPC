@@ -11,7 +11,7 @@
     WRITE(*,*)"|       \$$              \$$$$$$  \$$        \$$$$$$          |"
     WRITE(*,*)"|                                                             |"
     WRITE(*,*)"|    A library for exclusive photon-photon processes in       |"
-    WRITE(*,*)"|    ultraperipheral proton and nuclear collisions (v1.8)     |"
+    WRITE(*,*)"|    ultraperipheral proton and nuclear collisions (v2.0)     |"
     WRITE(*,*)"|                                                             |"
     WRITE(*,*)"|    By Hua-Sheng Shao (LPTHE) and David d'Enterria (CERN)    |"
     WRITE(*,*)"|                                                             |"
