@@ -3,17 +3,42 @@ MODULE ElasticFlux
   USE OpticalGlauber_Geometry
   USE NINTLIB ! for multiple dimensional integrations
   USE interpolation
+  USE bessel_integration
+  USE alpha_running
   IMPLICIT NONE
   PRIVATE
   REAL(KIND(1d0)),PUBLIC::alphaem_elasticphoton=0.0072992700729927005d0
   REAL(KIND(1d0)),PUBLIC::aqedup=0.0072992700729927005d0
   REAL(KIND(1d0)),PARAMETER,PUBLIC::LOWER_BFactor_Limit=1D-1
   REAL(KIND(1d0)),PARAMETER,PUBLIC::GeVm12fm=0.1973d0 ! GeV-1 to fm
+  REAL(KIND(1d0)),PARAMETER,PUBLIC::mproton=0.938272081d0 ! the mass of proton (GeV), module-wide (new code, structure_functions)
+  ! running alpha(Q2)/alpha(0) of the photon (as LUXqed) in each amplitude of the proton photon density with ChFF,
+  ! small-x approximation and exact; alpha(Q2) of LbLatNLO at q2=-Q2 without its two-loop QCD term (alpha_running.f90)
+  ! default .FALSE.: with it the photon-photon grid build is x22 slower (small-x approximation, x9 exact)
+  LOGICAL,PUBLIC::alpha_running4photon=.FALSE.
+  ! grids built on demand where the direct evaluation is numerical: the correction beyond the dipole of the exact
+  ! distribution (exact_correction_grid) and, in PhotonPhotonFlux, the collinear proton flux; .FALSE.: direct
+  LOGICAL,PUBLIC::GENERATE_PROTON_FLUX_GRID=.TRUE.
+  ! alpha(Q2)/alpha(0)-1 = sum_j crun(j)*Q2/(Q2+srun(j)), j=0,nrun: alpha_ratio_ph as a sum of poles, for the closed forms
+  INCLUDE 'alpha_running_poles.inc'
+  ! x and form factors of the exact proton distribution, for its integrands
+  REAL(KIND(1d0))::xexact
+  INTEGER::iFFexact ! < 0: only the part beyond the dipole
+  ! form factor of the correction beyond the dipole in the small-x approximation (1 dde1, 2 luxqed)
+  INTEGER::iFFcorr=1
+  ! Q2 (GeV**2) above which the integrand of the correction vanishes: G_E=G_dipole above 3.5 for dde1
+  ! (see ratio_dde1); for luxqed G_E=rE*G_dipole above the A1 table (9.995), and the correction
+  ! is (rE-1)*dipole plus the integral of G_E-rE*G_dipole below 9.995
+  REAL(KIND(1d0)),DIMENSION(2),PARAMETER::Q2max_corr=(/3.5d0,9.995d0/)
+  REAL(KIND(1d0)),PARAMETER::mupomuN=2.793d0 ! magnetic moment of proton
   PUBLIC::PhotonNumberDensity ! EDFF
   ! ChFF
   PUBLIC::PhotonNumberDensity_ChargeFormFactor_WS,PhotonNumberDensity_ChargeFormFactor_proton
   PUBLIC::PhotonFlux_proton_EDFF_nob,PhotonFlux_proton_ChFF_nob
   PUBLIC::PhotonFlux_nucleus_EDFF_nob,PhotonFlux_nucleus_ChFF_nob
+  ! proton without the small-x approximation
+  PUBLIC::PhotonNumberDensity_ChargeFormFactor_proton_exact,PhotonFlux_proton_ChFF_exact_nob
+  PUBLIC::alpha_norm_mu ! alpha(0)/alpha(mu2) of an elastic photon at the scale mu with alpha_running4photon
   ! For generating virtualities of initial photons
   PUBLIC::generate_Q2_epa_proton_iWW,generate_Q2_epa_ion_ChFF
   PUBLIC::progress
@@ -35,17 +60,18 @@ CONTAINS
     RETURN
   END FUNCTION PhotonNumberDensity
 
-  FUNCTION PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,CORRECTIONQ,MINUSDIPOLESQUAREQ)
+  FUNCTION PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,CORRECTIONQ,MINUSDIPOLESQUAREQ,MU2)
     ! It gives us the photon number density with Z=1 and alpha=1
     ! b should be written in unit of GeV-1
     ! 1 GeV^-1 = 0.1973e-15 m = 0.1973 fm
     IMPLICIT NONE
     REAL(KIND(1d0))::PhotonNumberDensity_ChargeFormFactor_proton
     REAL(KIND(1d0)),INTENT(IN)::b,Ega,gamma
-    LOGICAL,INTENT(IN),OPTIONAL::CORRECTIONQ ! whether we need to include the correction beyond the dipole
-                                             ! the default is no (.FALSE.)
+    INTEGER,INTENT(IN),OPTIONAL::CORRECTIONQ ! the correction beyond the dipole: 0 none (default),
+                                             ! 1 dde1 (ratio_dde1), 2 luxqed (formfactor_A1)
     LOGICAL,INTENT(IN),OPTIONAL::MINUSDIPOLESQUAREQ ! whether we want to minus the dipole square
                                                     ! the default is no (.FALSE.)
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2 ! scale (GeV**2) of the photon normalisation, see alpha_norm_mu
     REAL(KIND(1d0)),PARAMETER::aa=1.1867816581938533d0 ! in unit of GeV-1 = 1/DSQRT(0.71 GeV^2)
     REAL(KIND(1d0))::btilde,atilde
     REAL(KIND(1d0))::Egaoga
@@ -83,6 +109,8 @@ CONTAINS
             -2D0*atilde**2+(3d0-4d0*eulergamma+4d0*logtwo))
        integral=integral*Egaoga
     ENDIF
+    ! the running of alpha (alpha_running4photon)
+    integral=integral+dipole_running_amplitude(b,Egaoga)
     dipole=0d0
     IF(PRESENT(MINUSDIPOLESQUAREQ))THEN
        IF(MINUSDIPOLESQUAREQ)THEN
@@ -91,8 +119,9 @@ CONTAINS
     ENDIF
     corr=0d0
     IF(PRESENT(CORRECTIONQ))THEN
-       IF(CORRECTIONQ)THEN
+       IF(CORRECTIONQ.GT.0)THEN
           ! include the correction beyond the dipole
+          iFFcorr=CORRECTIONQ
           corr=PhotonNumberDensity_ChargeFormFactor_proton_correction(b,Ega,gamma,1)
           integral=integral+corr
        ENDIF
@@ -106,9 +135,22 @@ CONTAINS
     ELSE
        integral=integral**2
     ENDIF
-    PhotonNumberDensity_ChargeFormFactor_proton=one/pi2*integral
+    PhotonNumberDensity_ChargeFormFactor_proton=one/pi2*integral*alpha_norm_mu(MU2)
     RETURN
   END FUNCTION PhotonNumberDensity_ChargeFormFactor_proton
+
+  FUNCTION alpha_norm_mu(MU2)
+    ! the normalisation of an elastic photon at the scale mu (MU2 in GeV**2) with alpha_running4photon: alpha(0)/alpha(MU2),
+    ! as the inelastic photon (LUXqed, MSbar at mu): the photon then carries alpha(Q2)**2/alpha(mu2) and the hard process
+    ! must use alpha(mu2); the scale only moves alpha between the flux and the hard vertex (the product keeps alpha(Q2)**2
+    ! per photon). 1 with fixed alpha or without MU2 (mu = infinity: the photon normalised to alpha(0), hard vertex alpha(0))
+    IMPLICIT NONE
+    REAL(KIND(1d0))::alpha_norm_mu
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2
+    alpha_norm_mu=1d0
+    IF(.NOT.alpha_running4photon.OR..NOT.PRESENT(MU2))RETURN
+    IF(MU2.GT.0d0.AND.MU2.LT.HUGE(1d0))alpha_norm_mu=1d0/alpha_ratio_ph(MU2)
+  END FUNCTION alpha_norm_mu
 
   FUNCTION PhotonNumberDensity_ChargeFormFactor_proton_correction(b,Ega,gamma,integ_method)
     ! It gives us the photon number density with Z=1 and alpha=1 (only the correction part beyond the dipole FF)
@@ -131,6 +173,8 @@ CONTAINS
     INTEGER::init=0
     INTEGER::NXA,NYA,i,j,n,k,l
     SAVE init,NXA,NYA
+    INTEGER::iFF_grid=0 ! the form factor and running of the grid (corr_grid_key)
+    SAVE iFF_grid
     INTEGER::NYA_save=0
     SAVE NYA_save
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::XA,YA
@@ -169,6 +213,11 @@ CONTAINS
     IF(PRESENT(integ_method))THEN
        integ_method6=integ_method
     ENDIF
+    IF(init.EQ.1.AND.corr_grid_key().NE.iFF_grid.AND.integ_method6.GE.0)THEN
+       ! another form factor or running of alpha: generate the grid again
+       init=0
+       NYA_save=0
+    ENDIF
     IF(init.EQ.0.OR.xga.LT.xmin.OR.(integ_method6.LT.0))THEN
        ! first do a rescaling
        Egaoga_common=Egaoga
@@ -180,8 +229,8 @@ CONTAINS
           ELSE
              npoints=50000
              CALL trapezoid_integration(npoints,PND_ChargeFormFactor_proton_corr_fxn,&
-                  DSQRT(3.5d0),integral)
-             PhotonNumberDensity_ChargeFormFactor_proton_correction=integral
+                  DSQRT(Q2max_corr(iFFcorr)),integral)
+             PhotonNumberDensity_ChargeFormFactor_proton_correction=integral+corr_luxqed_dipole(b,Ega,gamma)
              RETURN
           ENDIF
        ENDIF
@@ -261,7 +310,7 @@ CONTAINS
           WRITE(*,*)"ERROR: K != NYA-1"
           STOP
        ENDIF
-       kTmax=DSQRT(3.5d0) ! match with Q2max in PND_ChargeFormFactor_proton_corr_fxn
+       kTmax=DSQRT(Q2max_corr(iFFcorr)) ! match with Q2max in PND_ChargeFormFactor_proton_corr_fxn
        YA(NYA)=DBLE(log10xmin)
        DO I=1,NXA
           IF(NYA_save.EQ.0)THEN
@@ -312,10 +361,11 @@ CONTAINS
                      b_common,Ega2,gamma
                 STOP
              ENDIF
-             ZA(I,J)=integral
+             ZA(I,J)=integral+corr_luxqed_dipole(XA(I),Ega2,gamma)
           ENDDO
        ENDDO
        init=1
+       iFF_grid=corr_grid_key()
     ENDIF
     IF(b.GT.rescaling_bmax_save.OR.b.LE.0d0)THEN
        PhotonNumberDensity_ChargeFormFactor_proton_correction=0d0
@@ -389,7 +439,6 @@ CONTAINS
     REAL(KIND(1d0)),EXTERNAL::BESSJ1
     REAL(KIND(1d0))::Egaoga_common,b_common
     COMMON/PND_CFF_proton_corr/Egaoga_common,b_common
-    REAL(KIND(1d0)),PARAMETER::Q2max=3.5d0 ! in GeV**2: the correction vanishes above (see ratio_dde1)
     REAL(KIND(1d0))::Q2 ! ,expo
     REAL(KIND(1d0)),PARAMETER::one=1d0
     ! the parameter in the dipole form factor
@@ -405,20 +454,47 @@ CONTAINS
     pref=kT**2/(kT**2+Egaoga_common**2)
     !pref=pref**2*PIo2*Egaoga_common
     Q2=kT**2+Egaoga_common**2
-    IF(Q2.GE.Q2max)THEN
+    IF(Q2.GE.Q2max_corr(iFFcorr))THEN
        PND_ChargeFormFactor_proton_corr_fxn=0d0
        RETURN
     ENDIF
     dipole=one/(one+Q2*aa**2)**2
-    CFF=dipole*(ratio_dde1(Q2)-one)
+    IF(iFFcorr.EQ.2)THEN
+       CFF=formfactor_A1(Q2,1)-A1_end_ratio(1)*dipole ! G_E-rE*G_dipole
+    ELSE
+       CFF=dipole*(ratio_dde1(Q2)-one)
+    ENDIF
     IF(ISNAN(CFF))THEN
        PRINT *, "ChargeFormFactor is NaN with ",DSQRT(Q2)
        STOP
        CFF=0d0
     ENDIF
+    IF(alpha_running4photon)CFF=CFF*alpha_ratio_ph(Q2)
     PND_ChargeFormFactor_proton_corr_fxn=pref*BESSJ1(bkT)*CFF
     RETURN
   END FUNCTION PND_ChargeFormFactor_proton_corr_fxn
+
+  FUNCTION corr_grid_key()
+    ! the settings of the correction grids: form factor (iFFcorr) and running of alpha
+    IMPLICIT NONE
+    INTEGER::corr_grid_key
+    corr_grid_key=iFFcorr+MERGE(10,0,alpha_running4photon)
+    RETURN
+  END FUNCTION corr_grid_key
+
+  FUNCTION corr_luxqed_dipole(b,Ega,gamma)
+    ! for luxqed (iFFcorr=2), the part (rE-1)*dipole of the correction (in the amplitude), with
+    ! rE=G_E/G_dipole above the A1 table
+    IMPLICIT NONE
+    REAL(KIND(1d0))::corr_luxqed_dipole
+    REAL(KIND(1d0)),INTENT(IN)::b,Ega,gamma
+    REAL(KIND(1d0)),PARAMETER::PIPI=3.14159265358979323846264338328d0
+    corr_luxqed_dipole=0d0
+    IF(iFFcorr.NE.2)RETURN
+    corr_luxqed_dipole=(A1_end_ratio(1)-1d0)*&
+         PIPI*DSQRT(PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma))
+    RETURN
+  END FUNCTION corr_luxqed_dipole
 
   FUNCTION ratio_dde1(Q2)
     ! G_E/G_dipole of the proton used with proton_FF_correction (Q2 in GeV**2):
@@ -467,6 +543,458 @@ CONTAINS
       join=((2d0*t-3d0)*t*t+1d0)*f0+((t-2d0)*t+1d0)*t*h*d0+(3d0-2d0*t)*t*t*f1+(t-1d0)*t*t*h*d1
     END FUNCTION join
   END FUNCTION ratio_dde1
+
+  FUNCTION PhotonNumberDensity_ChargeFormFactor_proton_exact(b,Ega,gamma,iFF,integ_method,MU2)
+    ! It gives us the photon number density with Z=1 and alpha=1 of the proton without the small-x approximation:
+    ! Dirac (F1) and Pauli (F2) form factors at Q2=(kT**2+x**2*mproton**2)/(1-x), b~=b/(1-x)
+    ! (eqs.(44)-(46) of Magnetic_EPA/coherent_short.tex; xfxbQ2_GPDel in the Python code)
+    ! b should be written in unit of GeV-1
+    ! iFF: proton form factors, 0: dipole, 1: dde1 (as proton_FF_correction), 2: luxqed (A1 fit)
+    ! the dipole part is analytic (exact_dipole_amplitudes), the correction beyond it is integrated
+    ! numerically up to b = bmaxoR*Rproton (as in PhotonNumberDensity_ChargeFormFactor_proton_correction)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::PhotonNumberDensity_ChargeFormFactor_proton_exact
+    REAL(KIND(1d0)),INTENT(IN)::b,Ega,gamma
+    INTEGER,INTENT(IN)::iFF
+    INTEGER,INTENT(IN),OPTIONAL::integ_method ! direct numerical integration of all when integ_method < 0
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2 ! scale (GeV**2) of the photon normalisation, see alpha_norm_mu
+    REAL(KIND(1d0)),PARAMETER::pi2=9.86960440108935861883449099988d0
+    REAL(KIND(1d0)),PARAMETER::bmaxoR=10d0
+    REAL(KIND(1d0)),PARAMETER::Rproton=0.877d0 ! the charge radius of proton (in fm)
+    INTEGER,DIMENSION(6),PARAMETER::nj=(/1,0,0,2,1,0/) ! the orders of the Bessel functions
+    REAL(KIND(1d0)),DIMENSION(6)::integrals,corr
+    LOGICAL::direct
+    PhotonNumberDensity_ChargeFormFactor_proton_exact=0d0
+    xexact=Ega/(gamma*mproton)
+    IF(xexact.GE.1d0)RETURN
+    direct=b.LE.0d0
+    IF(PRESENT(integ_method))direct=direct.OR.integ_method.LT.0
+    ! the six integrals int dkT kT**nk/D F_i J_n(b~ kT) of exact_integrands
+    IF(direct)THEN
+       iFFexact=iFF
+       CALL bessel_integrate(exact_integrands,6,nj,b/(1d0-xexact),xexact*mproton,HUGE(1d0),&
+            exact_edges(),integrals)
+    ELSE
+       CALL exact_dipole_amplitudes(b/(1d0-xexact),1d0,mupomuN,integrals)
+       IF(iFF.NE.0.AND.b.LE.bmaxoR*Rproton/GeVm12fm)THEN
+          ! F_i - F_i(dipole), zero above Q2max_corr for dde1; for luxqed F_i - F_i(rescaled dipole) is zero
+          ! above Q2max_corr and the rescaled dipole (G_E=rE*G_D, G_M=rM*mupomuN*G_D) minus the dipole is analytic
+          IF(GENERATE_PROTON_FLUX_GRID)THEN
+             corr=exact_correction_grid(b/(1d0-xexact),xexact,iFF)
+          ELSE
+             corr=exact_correction(b/(1d0-xexact),xexact,iFF)
+          ENDIF
+          integrals=integrals+corr
+          IF(iFF.EQ.2)THEN
+             CALL exact_dipole_amplitudes(b/(1d0-xexact),A1_end_ratio(1)-1d0,mupomuN*(A1_end_ratio(2)-1d0),corr)
+             integrals=integrals+corr
+          ENDIF
+       ENDIF
+    ENDIF
+    PhotonNumberDensity_ChargeFormFactor_proton_exact=exact_combination(integrals)/pi2/(1d0-xexact)**2*alpha_norm_mu(MU2)
+    RETURN
+  END FUNCTION PhotonNumberDensity_ChargeFormFactor_proton_exact
+
+  FUNCTION exact_correction(bt,x,iFF)
+    ! the six integrals of exact_integrands with F_i - F_i(dipole) (rescaled dipole for luxqed), zero above
+    ! Q2max_corr, at b~=bt and x (sets xexact and iFFexact)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),DIMENSION(6)::exact_correction
+    REAL(KIND(1d0)),INTENT(IN)::bt,x
+    INTEGER,INTENT(IN)::iFF
+    INTEGER,DIMENSION(6),PARAMETER::nj=(/1,0,0,2,1,0/) ! the orders of the Bessel functions
+    xexact=x
+    iFFexact=-iFF
+    CALL bessel_integrate(exact_integrands,6,nj,bt,x*mproton,DSQRT(MAX(Q2max_corr(iFF)*(1d0-x)-(x*mproton)**2,0d0)),&
+         exact_edges(),exact_correction)
+    RETURN
+  END FUNCTION exact_correction
+
+  FUNCTION exact_correction_grid(bt,x,iFF)
+    ! exact_correction from a grid in v=log(x/(1-x)) and t=log(bt)+bt/BETA (log at small b~, uniform steps BETA*HT
+    ! at large b~, where the correction oscillates with the joins of the form factors), XCMIN<=x<=XCMAX,
+    ! BTMIN<=bt<=BTMAX; 6-point Lagrange interpolation in v and t; a node is computed when first needed (all six
+    ! integrals, without the cut at bmaxoR*Rproton, applied by the caller). Direct evaluation outside.
+    IMPLICIT NONE
+    REAL(KIND(1d0)),DIMENSION(6)::exact_correction_grid
+    REAL(KIND(1d0)),INTENT(IN)::bt,x
+    INTEGER,INTENT(IN)::iFF
+    REAL(KIND(1d0)),PARAMETER::XCMIN=1d-9,XCMAX=0.3d0,BTMIN=1d-2,BTMAX=1d2,BETA=1d0 ! x<=0.3: luxqed 2e-5 at x>0.35
+    REAL(KIND(1d0)),PARAMETER::HX=0.1151292546497023d0,HT=0.2d0 ! 20 per decade in x; 0.2 GeV-1 at large b~
+    INTEGER,PARAMETER::NP=6,NXC=185,NTC=550 ! v(NXC)>log(XCMAX/(1-XCMAX)); t(NTC)>log(BTMAX)+BTMAX/BETA
+    REAL(KIND(1d0)),DIMENSION(6,NXC,NTC)::C
+    LOGICAL,DIMENSION(NXC,NTC)::done
+    INTEGER::gkey=-1
+    SAVE C,done,gkey
+    REAL(KIND(1d0))::v,t,v0,t0,wx(NP),wt(NP),xsave,xn,bn
+    INTEGER::i0,j0,i,j,k,isave
+    IF(x.LT.XCMIN.OR.x.GT.XCMAX.OR.bt.LT.BTMIN.OR.bt.GT.BTMAX)THEN
+       exact_correction_grid=exact_correction(bt,x,iFF)
+       RETURN
+    ENDIF
+    IF(gkey.NE.iFF+MERGE(10,0,alpha_running4photon))THEN
+       done=.FALSE.
+       gkey=iFF+MERGE(10,0,alpha_running4photon)
+    ENDIF
+    v0=DLOG(XCMIN/(1d0-XCMIN)); t0=DLOG(BTMIN)+BTMIN/BETA
+    v=DLOG(x/(1d0-x)); t=DLOG(bt)+bt/BETA
+    i0=MIN(MAX(FLOOR((v-v0)/HX)+1-(NP/2-1),1),NXC-NP+1)
+    j0=MIN(MAX(FLOOR((t-t0)/HT)+1-(NP/2-1),1),NTC-NP+1)
+    xsave=xexact; isave=iFFexact
+    DO i=i0,i0+NP-1
+       DO j=j0,j0+NP-1
+          IF(.NOT.done(i,j))THEN
+             xn=1d0/(1d0+DEXP(-(v0+(i-1)*HX))) ! x of the node
+             bn=bt_of_t(t0+(j-1)*HT)
+             C(:,i,j)=exact_correction(bn,xn,iFF)
+             done(i,j)=.TRUE.
+          ENDIF
+       ENDDO
+    ENDDO
+    xexact=xsave; iFFexact=isave
+    wx=lagrange_weights(v,v0+(i0-1)*HX,HX)
+    wt=lagrange_weights(t,t0+(j0-1)*HT,HT)
+    DO k=1,6
+       exact_correction_grid(k)=DOT_PRODUCT(wx,MATMUL(C(k,i0:i0+NP-1,j0:j0+NP-1),wt))
+    ENDDO
+    RETURN
+  CONTAINS
+    FUNCTION bt_of_t(tt) ! inverse of t=log(b~)+b~/BETA (Newton)
+      REAL(KIND(1d0))::bt_of_t
+      REAL(KIND(1d0)),INTENT(IN)::tt
+      INTEGER::n
+      bt_of_t=MIN(DEXP(tt),BETA*MAX(tt,1d0))
+      DO n=1,100
+         bt_of_t=bt_of_t-(DLOG(bt_of_t)+bt_of_t/BETA-tt)/(1d0/bt_of_t+1d0/BETA)
+      ENDDO
+    END FUNCTION bt_of_t
+    FUNCTION lagrange_weights(y,y1,h) ! weights of the NP nodes y1+(k-1)*h at y
+      REAL(KIND(1d0)),DIMENSION(NP)::lagrange_weights
+      REAL(KIND(1d0)),INTENT(IN)::y,y1,h
+      INTEGER::kk,l
+      lagrange_weights=1d0
+      DO kk=1,NP
+         DO l=1,NP
+            IF(l.NE.kk)lagrange_weights(kk)=lagrange_weights(kk)*(y-y1-(l-1)*h)/((kk-l)*h)
+         ENDDO
+      ENDDO
+    END FUNCTION lagrange_weights
+  END FUNCTION exact_correction_grid
+
+  FUNCTION PhotonFlux_proton_ChFF_exact_nob(x,iFF,MU2)
+    ! set PNOHARD=1
+    ! for proton with the exact distribution: int d^2b of PhotonNumberDensity_ChargeFormFactor_proton_exact
+    ! by Parseval, alpha/x*2/pi*int dkT/kT of exact_combination with the integrals replaced by their integrands
+    IMPLICIT NONE
+    REAL(KIND(1d0))::PhotonFlux_proton_ChFF_exact_nob
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::iFF
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2 ! scale (GeV**2) of the photon normalisation, see alpha_norm_mu
+    REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
+    REAL(KIND(1d0))::alpha,integral(1)
+    alpha=alphaem_elasticphoton
+    IF(alpha.LT.0d0)alpha=MERGE(aqedup,0.0072992701d0,aqedup.GT.0d0)
+    PhotonFlux_proton_ChFF_exact_nob=0d0
+    IF(x.GE.1d0)RETURN
+    xexact=x
+    iFFexact=iFF
+    CALL bessel_integrate(exact_collinear_integrand,1,(/-1/),0d0,x*mproton,HUGE(1d0),exact_edges(),integral)
+    PhotonFlux_proton_ChFF_exact_nob=alpha/x*2d0/pi*integral(1)*alpha_norm_mu(MU2)
+    RETURN
+  END FUNCTION PhotonFlux_proton_ChFF_exact_nob
+
+  SUBROUTINE exact_integrands(kT,n,v)
+    ! kT**nk/D*F_i(Q2) (times alpha(Q2)/alpha(0) with alpha_running4photon) for
+    ! (F_i,nk) = (F1,2),(F1,1),(F2,3),(F2,3),(F2,2),(F2,1), D=kT**2+x**2*mproton**2, Q2=D/(1-x)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::kT
+    INTEGER,INTENT(IN)::n
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(OUT)::v
+    REAL(KIND(1d0))::D,Q2,F1,F2,F1D,F2D,ar
+    D=kT**2+(xexact*mproton)**2
+    Q2=D/(1d0-xexact)
+    CALL proton_F1F2(Q2,ABS(iFFexact),F1,F2)
+    IF(iFFexact.LT.0)THEN ! only the part beyond the dipole (rescaled for luxqed)
+       CALL proton_F1F2(Q2,MERGE(3,0,iFFexact.EQ.-2),F1D,F2D)
+       F1=F1-F1D
+       F2=F2-F2D
+    ENDIF
+    IF(alpha_running4photon)THEN
+       ar=alpha_ratio_ph(Q2)
+       F1=F1*ar
+       F2=F2*ar
+    ENDIF
+    v=(/kT**2*F1,kT*F1,kT**3*F2,kT**3*F2,kT**2*F2,kT*F2/)/D
+    RETURN
+  END SUBROUTINE exact_integrands
+
+  SUBROUTINE dipole_running_collinear_integrand(kT,n,v)
+    ! (kT**2/Q2 G_D(Q2) alpha(Q2)/alpha(0))**2/kT, Q2=kT**2+x**2*mproton**2 (small-x approximation)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::kT
+    INTEGER,INTENT(IN)::n
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(OUT)::v
+    REAL(KIND(1d0))::Q2
+    Q2=kT**2+(xexact*mproton)**2
+    v(1)=(kT**2/Q2/(1d0+Q2/0.71d0)**2*alpha_ratio_ph(Q2))**2/kT
+    RETURN
+  END SUBROUTINE dipole_running_collinear_integrand
+
+  SUBROUTINE exact_collinear_integrand(kT,n,v)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::kT
+    INTEGER,INTENT(IN)::n
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(OUT)::v
+    REAL(KIND(1d0)),DIMENSION(6)::h
+    CALL exact_integrands(kT,6,h)
+    v(1)=exact_combination(h)/kT
+    RETURN
+  END SUBROUTINE exact_collinear_integrand
+
+  FUNCTION exact_combination(I)
+    ! the bracket of eqs.(44)-(46), in the integrals I of exact_integrands
+    IMPLICIT NONE
+    REAL(KIND(1d0))::exact_combination
+    REAL(KIND(1d0)),DIMENSION(6),INTENT(IN)::I ! F1J1,F1J0,F2J0_k3,F2J2,F2J1,F2J0_k
+    REAL(KIND(1d0))::x,mp2
+    x=xexact
+    mp2=mproton**2
+    exact_combination=(1d0+(1d0-x)**2)/2d0*I(1)**2+(I(3)**2+I(4)**2)/(8d0*mp2)&
+         +x**2/2d0*(I(3)*I(6)+I(5)**2/2d0+I(1)*I(5)+I(2)*(I(3)+2d0*x**2*mp2*I(6)))&
+         +x**4*mp2/2d0*(I(2)**2+I(6)**2)
+    RETURN
+  END FUNCTION exact_combination
+
+  FUNCTION exact_edges()
+    ! kT where the form factors at Q2=(kT**2+x**2*mproton**2)/(1-x) are not smooth (panel edges)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::exact_edges
+    REAL(KIND(1d0)),DIMENSION(4),PARAMETER::Q2dde1=(/1.02d0,1.22d0,2.5d0,3.5d0/) ! joins of ratio_dde1
+    REAL(KIND(1d0)),DIMENSION(7),PARAMETER::Q2A1=(/0.25d0,0.5d0,0.75d0,1d0,1.5d0,3d0,9.995d0/)
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::k2
+    SELECT CASE(ABS(iFFexact))
+    CASE(1)
+       k2=(1d0-xexact)*Q2dde1-(xexact*mproton)**2
+    CASE(2)
+       k2=(1d0-xexact)*Q2A1-(xexact*mproton)**2
+    CASE DEFAULT
+       ALLOCATE(k2(0))
+    END SELECT
+    exact_edges=DSQRT(PACK(k2,k2.GT.0d0))
+    RETURN
+  END FUNCTION exact_edges
+
+  SUBROUTINE proton_F1F2(Q2,iFF,F1,F2)
+    ! Dirac and Pauli form factors of the proton from G_E=F1-tau*F2, G_M=F1+F2 (Q2 in GeV**2)
+    ! iFF=0: dipole, G_E=G_D, G_M=mup*G_D; 1: G_E=G_D*ratio_dde1, G_M=mup*G_D; 2: A1 fit (luxqed);
+    ! 3: G_E=rE*G_D, G_M=rM*mup*G_D (A1_end_ratio)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::Q2
+    INTEGER,INTENT(IN)::iFF
+    REAL(KIND(1d0)),INTENT(OUT)::F1,F2
+    REAL(KIND(1d0))::tau,GD,GE,GM
+    tau=Q2/(4d0*mproton**2)
+    GD=1d0/(1d0+Q2/0.71d0)**2
+    SELECT CASE(iFF)
+    CASE(1)
+       GE=GD*ratio_dde1(Q2)
+       GM=mupomuN*GD
+    CASE(2)
+       GE=formfactor_A1(Q2,1)
+       GM=mupomuN*formfactor_A1(Q2,2)
+    CASE(3) ! the dipole rescaled to the A1 fit above its table
+       GE=A1_end_ratio(1)*GD
+       GM=mupomuN*A1_end_ratio(2)*GD
+    CASE DEFAULT
+       GE=GD
+       GM=mupomuN*GD
+    END SELECT
+    F1=(GE+tau*GM)/(1d0+tau)
+    F2=(GM-GE)/(1d0+tau)
+    RETURN
+  END SUBROUTINE proton_F1F2
+
+  FUNCTION formfactor_A1(Q2,i)
+    ! G_E (i=1) and G_M/mup (i=2) of the A1 world fit with polarised data (as LUXqed),
+    ! cubic spline of the tabulated values; above the table the dipole shape normalised at its end
+    IMPLICIT NONE
+    REAL(KIND(1d0))::formfactor_A1
+    REAL(KIND(1d0)),INTENT(IN)::Q2
+    INTEGER,INTENT(IN)::i
+    REAL(KIND(1d0)),DIMENSION(0:1000)::a1GE,a1GM
+    INCLUDE 'proton_A1_formfactors.inc'
+    REAL(KIND(1d0)),DIMENSION(0:1000)::q
+    REAL(KIND(1d0)),DIMENSION(0:1000,2)::bs,cs,ds
+    INTEGER::init=0,j
+    SAVE init,q,bs,cs,ds
+    IF(init.EQ.0)THEN
+       q=(/0d0,(0.005d0+0.01d0*(j-1),j=1,1000)/)
+       CALL spline(q,a1GE,bs(:,1),cs(:,1),ds(:,1),1001)
+       CALL spline(q,a1GM,bs(:,2),cs(:,2),ds(:,2),1001)
+       init=1
+    ENDIF
+    IF(Q2.GE.q(1000))THEN
+       formfactor_A1=MERGE(a1GE(1000),a1GM(1000),i.EQ.1)*((1d0+q(1000)/0.71d0)/(1d0+Q2/0.71d0))**2
+    ELSEIF(i.EQ.1)THEN
+       formfactor_A1=ispline(Q2,q,a1GE,bs(:,1),cs(:,1),ds(:,1),1001)
+    ELSE
+       formfactor_A1=ispline(Q2,q,a1GM,bs(:,2),cs(:,2),ds(:,2),1001)
+    ENDIF
+    RETURN
+  END FUNCTION formfactor_A1
+
+  FUNCTION A1_end_ratio(i)
+    ! G_E/G_D (i=1) and G_M/(mup*G_D) (i=2) of formfactor_A1 above the A1 table
+    IMPLICIT NONE
+    REAL(KIND(1d0))::A1_end_ratio
+    INTEGER,INTENT(IN)::i
+    A1_end_ratio=formfactor_A1(1d2,i)*(1d0+1d2/0.71d0)**2
+    RETURN
+  END FUNCTION A1_end_ratio
+
+  SUBROUTINE partial_fractions(p,a2,n0,n1,C)
+    ! (n0+n1*y)/((y+a2)**2*prod_i(y+p(i))) = sum_i C(i)/(y+p(i)) + C(n+1)/(y+a2) + C(n+2)/(y+a2)**2, n=SIZE(p)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),DIMENSION(:),INTENT(IN)::p
+    REAL(KIND(1d0)),INTENT(IN)::a2,n0,n1
+    REAL(KIND(1d0)),DIMENSION(SIZE(p)+2),INTENT(OUT)::C
+    INTEGER::i,l,n
+    n=SIZE(p)
+    DO i=1,n
+       C(i)=(n0-n1*p(i))/((a2-p(i))**2*PRODUCT(p-p(i),MASK=(/(l.NE.i,l=1,n)/)))
+    ENDDO
+    C(n+2)=(n0-n1*a2)/PRODUCT(p-a2)
+    C(n+1)=(n1-C(n+2)*PRODUCT(p-a2)*SUM(1d0/(p-a2)))/PRODUCT(p-a2)
+    RETURN
+  END SUBROUTINE partial_fractions
+
+  SUBROUTINE exact_dipole_amplitudes(bt,cE,cM,I)
+    ! the integrals of exact_integrands at b~=bt in closed form, for G_E=cE*G_D and G_M=cM*G_D:
+    ! F1 and F2 are rational in y=kT**2, with poles at y=-a2 (double, G_D) and -c2 (1+tau), and 1/D=1/(y+w2);
+    ! by partial fractions the integrals are sums of int dkT kT**p J_n(bt kT)/(kT**2+m2)**(1 or 2),
+    ! which are modified Bessel functions K_n (exact_dipole_basis).
+    ! With alpha_running4photon, alpha(Q2)/alpha(0)=1+sum_j crun(j) Q2/(Q2+srun(j)) (alpha_running_poles.inc):
+    ! each term gives the same integrals with 1/D replaced by 1/(y+w2+(1-x)*srun(j))
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::bt,cE,cM
+    REAL(KIND(1d0)),DIMENSION(6),INTENT(OUT)::I
+    REAL(KIND(1d0)),PARAMETER::Lambda2=0.71d0 ! the parameter in the dipole form factor (GeV**2)
+    REAL(KIND(1d0))::s,w2,a2,c2,P,Q4,e2
+    REAL(KIND(1d0)),DIMENSION(0:2)::Ka,Kc
+    INTEGER::j
+    s=1d0-xexact
+    w2=(xexact*mproton)**2
+    a2=w2+s*Lambda2
+    c2=w2+4d0*s*mproton**2
+    P=(s*Lambda2)**2
+    Q4=4d0*s*mproton**2
+    CALL besselK012(DSQRT(a2)*bt,Ka)
+    CALL besselK012(DSQRT(c2)*bt,Kc)
+    I=amplitudes(w2)
+    IF(alpha_running4photon)THEN
+       DO j=0,nrun
+          e2=w2+s*srun(j)
+          I=I+crun(j)*amplitudes(e2)
+       ENDDO
+    ENDIF
+    RETURN
+  CONTAINS
+    FUNCTION amplitudes(q) ! the six integrals with 1/(y+q) in place of 1/D
+      REAL(KIND(1d0)),DIMENSION(6)::amplitudes
+      REAL(KIND(1d0)),INTENT(IN)::q
+      REAL(KIND(1d0)),DIMENSION(0:2)::Kq
+      REAL(KIND(1d0)),DIMENSION(4)::CF1,CF2 ! coefficients of 1/(y+c2),1/(y+q),1/(y+a2),1/(y+a2)**2 for F1, F2
+      REAL(KIND(1d0)),DIMENSION(4,4)::L ! L(t,j): basis integral t for the j-th term
+      INTEGER::t
+      CALL besselK012(DSQRT(q)*bt,Kq)
+      CALL partial_fractions((/c2,q/),a2,P*(cM*w2+Q4*cE),P*cM,CF1)
+      CALL partial_fractions((/c2,q/),a2,P*(cM-cE)*Q4,0d0,CF2)
+      DO t=1,4
+         L(t,:)=(/exact_dipole_basis(t,c2,bt,Kc,.FALSE.),exact_dipole_basis(t,q,bt,Kq,.FALSE.),&
+              exact_dipole_basis(t,a2,bt,Ka,.FALSE.),exact_dipole_basis(t,a2,bt,Ka,.TRUE.)/)
+      ENDDO
+      amplitudes=(/DOT_PRODUCT(CF1,L(1,:)),DOT_PRODUCT(CF1,L(2,:)),DOT_PRODUCT(CF2,L(3,:)),&
+           DOT_PRODUCT(CF2,L(4,:)),DOT_PRODUCT(CF2,L(1,:)),DOT_PRODUCT(CF2,L(2,:))/)
+    END FUNCTION amplitudes
+  END SUBROUTINE exact_dipole_amplitudes
+
+  FUNCTION dipole_running_amplitude(b,Egaoga)
+    ! in the small-x approximation with alpha_running4photon, the part of the dipole amplitude
+    ! int dkT kT**2/(kT**2+Egaoga**2) G_D(Q2) J1(b kT) [alpha(Q2)/alpha(0)-1], Q2=kT**2+Egaoga**2, in closed form
+    ! (as exact_dipole_amplitudes)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::dipole_running_amplitude
+    REAL(KIND(1d0)),INTENT(IN)::b,Egaoga
+    REAL(KIND(1d0)),PARAMETER::Lambda2=0.71d0 ! the parameter in the dipole form factor (GeV**2)
+    REAL(KIND(1d0))::a2,e2
+    REAL(KIND(1d0)),DIMENSION(0:2)::Ka,Kq
+    REAL(KIND(1d0)),DIMENSION(3)::C
+    INTEGER::j
+    dipole_running_amplitude=0d0
+    IF(.NOT.alpha_running4photon.OR.b.LE.0d0)RETURN
+    a2=Egaoga**2+Lambda2
+    CALL besselK012(DSQRT(a2)*b,Ka)
+    DO j=0,nrun
+       e2=Egaoga**2+srun(j)
+       CALL besselK012(DSQRT(e2)*b,Kq)
+       CALL partial_fractions((/e2/),a2,Lambda2**2,0d0,C)
+       dipole_running_amplitude=dipole_running_amplitude+crun(j)*(C(1)*exact_dipole_basis(1,e2,b,Kq,.FALSE.)&
+            +C(2)*exact_dipole_basis(1,a2,b,Ka,.FALSE.)+C(3)*exact_dipole_basis(1,a2,b,Ka,.TRUE.))
+    ENDDO
+    RETURN
+  END FUNCTION dipole_running_amplitude
+
+  FUNCTION exact_dipole_basis(t,m2,bt,K,double)
+    ! int_0^infinity dkT kT**p J_n(bt kT)/(kT**2+m2) for t=1: (n,p)=(1,2), 2: (0,1), 3: (0,3), 4: (2,3)
+    ! (t=3,4 up to terms that cancel in exact_dipole_amplitudes), or with (kT**2+m2)**2 when double
+    IMPLICIT NONE
+    REAL(KIND(1d0))::exact_dipole_basis
+    INTEGER,INTENT(IN)::t
+    REAL(KIND(1d0)),INTENT(IN)::m2,bt
+    REAL(KIND(1d0)),DIMENSION(0:2),INTENT(IN)::K ! K_n(sqrt(m2)*bt) (besselK012)
+    LOGICAL,INTENT(IN)::double
+    REAL(KIND(1d0))::m,z
+    m=DSQRT(m2)
+    z=m*bt
+    SELECT CASE(MERGE(t+4,t,double))
+    CASE(1); exact_dipole_basis=m*K(1)
+    CASE(2); exact_dipole_basis=K(0)
+    CASE(3); exact_dipole_basis=-m2*K(0)
+    CASE(4); exact_dipole_basis=m2*K(2)
+    CASE(5); exact_dipole_basis=bt*K(0)/2d0
+    CASE(6); exact_dipole_basis=bt*K(1)/(2d0*m)
+    CASE(7); exact_dipole_basis=K(0)-z*K(1)/2d0
+    CASE DEFAULT; exact_dipole_basis=z*K(1)/2d0
+    END SELECT
+    RETURN
+  END FUNCTION exact_dipole_basis
+
+  SUBROUTINE besselK012(z,K)
+    ! modified Bessel functions K_0, K_1, K_2 at z > 0 to double precision, from
+    ! K_n(z) = int_0^infinity dt exp(-z cosh t) cosh(n t) by the trapezoid rule (exponentially convergent)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::z
+    REAL(KIND(1d0)),DIMENSION(0:2),INTENT(OUT)::K
+    REAL(KIND(1d0))::h,f,eh,et,ch,ch1
+    K=0d0
+    IF(z.GT.7d2)RETURN
+    h=MIN(0.1d0,0.5d0/DSQRT(z))
+    eh=EXP(h)
+    et=1d0
+    ch1=2d0*SINH(h/2d0)**2 ! cosh(h)-1
+    K=0.5d0
+    DO
+       et=et*eh ! exp(t), t=j*h
+       ch=(et+1d0/et)/2d0
+       IF(et.LT.2d0)ch1=2d0*SINH(DLOG(et)/2d0)**2 ! cosh(t)-1 without cancellation at small t
+       IF(et.GE.2d0)ch1=ch-1d0
+       f=EXP(-z*ch1) ! exp(-z (cosh t - 1))
+       K=K+f*(/1d0,ch,2d0*ch**2-1d0/)
+       IF(f*(2d0*ch**2-1d0).LT.1d-17*K(2))EXIT
+    ENDDO
+    K=h*EXP(-z)*K
+    RETURN
+  END SUBROUTINE besselK012
 
   FUNCTION PhotonNumberDensity_ChargeFormFactor_WS(b,Ega,gamma,RR,w,aa,bcut,btilcut,ibeam,integ_method)
     ! It gives us the photon number density with Z=1 and alpha=1 
@@ -1186,21 +1714,22 @@ CONTAINS
     RETURN
   END FUNCTION PhotonFlux_proton_dipole_nob
 
-  FUNCTION PhotonFlux_proton_ChFF_nob(x,gamma,CORRECTIONQ)
+  FUNCTION PhotonFlux_proton_ChFF_nob(x,gamma,CORRECTIONQ,MU2)
     ! set PNOHARD=1
     ! for proton with ChFF
     IMPLICIT NONE
     REAL(KIND(1d0))::PhotonFlux_proton_ChFF_nob
     REAL(KIND(1d0)),INTENT(IN)::x,gamma
-    LOGICAL,INTENT(IN),OPTIONAL::CORRECTIONQ ! whether we need to include the correction beyond the dipole
-                                             ! the default is no (.FALSE.)
+    INTEGER,INTENT(IN),OPTIONAL::CORRECTIONQ ! the correction beyond the dipole: 0 none (default),
+                                             ! 1 dde1, 2 luxqed (as in PhotonNumberDensity_ChargeFormFactor_proton)
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2 ! scale (GeV**2) of the photon normalisation, see alpha_norm_mu
     LOGICAL::corrQ
     INTEGER::init=0
     SAVE init
     REAL(KIND(1d0)),PARAMETER::mproton=0.938272081d0 ! the mass of proton (GeV)
     REAL(KIND(1d0))::alpha
     SAVE alpha
-    REAL(KIND(1d0))::aptilde,Egaoga
+    REAL(KIND(1d0))::aptilde,Egaoga,runcol(1)
     IF(init.EQ.0)THEN
        IF(alphaem_elasticphoton.LT.0d0)THEN
           IF(aqedup.GT.0d0)THEN
@@ -1214,7 +1743,8 @@ CONTAINS
        init=1
     ENDIF
     IF(PRESENT(CORRECTIONQ))THEN
-       corrQ=CORRECTIONQ
+       corrQ=CORRECTIONQ.GT.0
+       IF(corrQ)iFFcorr=CORRECTIONQ
     ELSE
        corrQ=.FALSE.
     ENDIF
@@ -1226,6 +1756,14 @@ CONTAINS
     ELSE
        PhotonFlux_proton_ChFF_nob=PhotonFlux_proton_dipole_nob(x)
     ENDIF
+    IF(alpha_running4photon)THEN
+       ! the dipole with the running of alpha, by Parseval: alpha/x*2/pi*int dkT/kT (kT**2/Q2 G_D alpha(Q2)/alpha(0))**2
+       xexact=x
+       CALL bessel_integrate(dipole_running_collinear_integrand,1,(/-1/),0d0,x*mproton,HUGE(1d0),(/0d0/),runcol)
+       PhotonFlux_proton_ChFF_nob=PhotonFlux_proton_ChFF_nob-PhotonFlux_proton_dipole_nob(x)+&
+            alpha/x*2d0/3.14159265358979323846264338328d0*runcol(1)
+    ENDIF
+    PhotonFlux_proton_ChFF_nob=PhotonFlux_proton_ChFF_nob*alpha_norm_mu(MU2)
     RETURN
   END FUNCTION PhotonFlux_proton_ChFF_nob
 
@@ -1243,6 +1781,8 @@ CONTAINS
     SAVE init
     INTEGER::MX_save=0
     SAVE MX_save
+    INTEGER::iFF_grid=0 ! the form factor and running of the grid (corr_grid_key)
+    SAVE iFF_grid
     REAL(KIND(1d0))::xmin=1D-8
     SAVE xmin
     INTEGER::log10xmin,log10xmin_before
@@ -1262,6 +1802,11 @@ CONTAINS
     IF(x.LE.1d-99.OR.gamma.LE.0d0)THEN
        PhotonFlux_proton_ChFF_corr_nob_eval=0d0
        RETURN
+    ENDIF
+    IF(init.EQ.1.AND.corr_grid_key().NE.iFF_grid)THEN
+       ! another form factor or running of alpha: generate the grid again
+       init=0
+       MX_save=0
     ENDIF
     IF(init.EQ.0.OR.x.LT.xmin)THEN
        log10xmin_before=INT(DLOG10(xmin))
@@ -1335,6 +1880,7 @@ CONTAINS
           ZD_save(I)=ZD(I)
        ENDDO
        init=1
+       iFF_grid=corr_grid_key()
     ENDIF
     XI(1)=DLOG10(x)
     IF(XI(1).GE.0d0)THEN
@@ -1367,7 +1913,7 @@ CONTAINS
        PhotonFlux_proton_ChFF_corr_nob_fxn=0d0
        RETURN
     ENDIF
-    PhotonFlux_proton_ChFF_corr_nob_fxn=PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,.TRUE.,.TRUE.)
+    PhotonFlux_proton_ChFF_corr_nob_fxn=PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,iFFcorr,.TRUE.)
     PhotonFlux_proton_ChFF_corr_nob_fxn=PhotonFlux_proton_ChFF_corr_nob_fxn*twopi*b
     RETURN
   END FUNCTION PhotonFlux_proton_ChFF_corr_nob_fxn

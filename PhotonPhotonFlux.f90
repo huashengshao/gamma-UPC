@@ -3,13 +3,32 @@ MODULE PhotonPhotonFlux
   USE OpticalGlauber_Geometry
   USE NINTLIB ! for multiple dimensional integrations
   USE interpolation
+  USE InelasticFlux,ONLY:PhotonNumberDensity_inelastic_proton,PhotonFlux_proton_inelastic_nob,inel_fast_prepare_rows
   IMPLICIT NONE
   PRIVATE
-  PUBLIC::alphaem_elasticphoton
+  PUBLIC::alphaem_elasticphoton,alpha_running4photon,GENERATE_PROTON_FLUX_GRID
   ! For UPCs photon-photon collisions
   LOGICAL,PUBLIC::USE_CHARGEFORMFACTOR4PHOTON=.FALSE.
+  ! when USE_CHARGEFORMFACTOR4PHOTON=.TRUE., the proton photon density without the small-x approximation
+  ! (PhotonNumberDensity_ChargeFormFactor_proton_exact) when USE_EXACT_ELASTIC4PHOTON=.TRUE.
+  LOGICAL,PUBLIC::USE_EXACT_ELASTIC4PHOTON=.FALSE.
+  ! final state of the protons (pp, and pA with the Woods-Saxon profile), P = P_NOHAD: 0 el-el P (elastic only,
+  ! default); 1 (el-inel + inel-el) P; 2 (el-el + el-inel + inel-el) (1-P) + inel-inel; 3 all without survival factor
+  ! (0+1+2 = 3). In pA only the proton has an inelastic photon (the nucleus coherent only): 1 inel-el P, 2 (el-el +
+  ! inel-el) (1-P), 3 (el + inel) el. The inelastic photon (InelasticFlux) at the scale mu = W_gammagamma
+  ! (mu2 = x1 x2 s_NN); the elastic one as set by the switches above
+  INTEGER,PUBLIC::photon_final_state=0
+  REAL(KIND(1d0)),PRIVATE::mu2_photon=0d0 ! the scale of the inelastic photons in PhotonPhotonFlux_pp_fxn (GeV^2)
+  ! alpha_norm_mu(mu2_photon) of ElasticFlux (the MU2 argument of the elastic proton functions): with alpha_running4photon
+  ! each elastic photon (proton and nucleus) of the photon-photon fluxes is normalised to alpha(mu2) as the inelastic
+  ! one (LUXqed, MSbar at mu = W), so the hard process uses alpha(mu2); 1 with fixed alpha
+  REAL(KIND(1d0)),PRIVATE::ael_photon=1d0
+  ! pp and pA with the exact proton distribution (USE_EXACT_ELASTIC4PHOTON): the proton b integrals start at EXACT_BLOW
+  ! times the lower limit of the small-x approximation (0.1 Rproton), as below it lies up to 9% of the flux at x = 0.5;
+  ! the part left out scales as b^4 (about 1e-5)
+  REAL(KIND(1d0)),PARAMETER,PRIVATE::EXACT_BLOW=0.1d0
   PUBLIC::PhotonPhotonFlux_pp,PhotonPhotonFlux_pp_eval
-  PUBLIC::PhotonFlux_proton_EDFF_nob,PhotonFlux_proton_ChFF_nob
+  PUBLIC::PhotonFlux_proton_EDFF_nob,PhotonFlux_proton_ChFF_nob,PhotonFlux_proton_ChFF_exact_nob
   PUBLIC::PhotonPhotonFlux_pA_hardsphere,PhotonPhotonFlux_pA_hardsphere_eval
   PUBLIC::PhotonPhotonFlux_pA_WoodsSaxon,PhotonPhotonFlux_pA_WoodsSaxon_eval
   PUBLIC::DeltaB_pp_at_x1x2,PhotonPhotonDeltaB_pp,PhotonPhotonDeltaB_pp_eval
@@ -22,6 +41,7 @@ MODULE PhotonPhotonFlux
   PUBLIC::PhotonNumberDensity ! EDFF
   ! ChFF
   PUBLIC::PhotonNumberDensity_ChargeFormFactor_WS,PhotonNumberDensity_ChargeFormFactor_proton
+  PUBLIC::PhotonNumberDensity_ChargeFormFactor_proton_exact
   ! Forward neutron tagging
   ! tagging neutrons for two beams
   ! -2 (0n+Xn), -1 (Xn), 0 (0n), 1 (1n), 2 (2n), 3 (3n), 4 (4n)
@@ -44,10 +64,10 @@ MODULE PhotonPhotonFlux
   INTEGER,PARAMETER,PRIVATE::SUB_FACTOR=2
   LOGICAL,PRIVATE,SAVE::print_banner=.FALSE.
   LOGICAL,PUBLIC::use_MC_Glauber=.FALSE.
-  LOGICAL,PUBLIC::proton_FF_correction=.FALSE. ! when USE_CHARGEFORMFACTOR4PHOTON=.TRUE., 
-                                               ! it will include the correction beyond proton dipole form factor
-                                               ! when proton_FF_correction=.TRUE.
-                                               ! it will impact both pp and pA UPCs
+  INTEGER,PUBLIC::proton_FF_correction=0 ! when USE_CHARGEFORMFACTOR4PHOTON=.TRUE., 
+                                         ! the proton form factors: 0 dipole, 1 dde1 (the correction beyond the dipole
+                                         ! of the former proton_FF_correction=.TRUE.), 2 luxqed (A1 fit)
+                                         ! it will impact both pp and pA UPCs
   INTEGER,PUBLIC::IEPSILON_EDFF=0  ! 0: bmin = RA; 1: bmin = RA+a
   LOGICAL,PRIVATE::CALC_DELTABQ=.FALSE. ! whether we want to calcuate DeltaB (.TRUE.) or not (.FALSE.)
   LOGICAL,PUBLIC::GENERATE_DELTAB_GRID=.FALSE. ! if true, it will always first generate the grid
@@ -202,6 +222,8 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(1)::XI,YI,ZI
     REAL(KIND(1d0))::pnohadval
     LOGICAL::force_pnohad1
+    INTEGER::gstate=0,gsel
+    SAVE gstate
     IF(.NOT.print_banner)THEN
        include "banner.inc"
        print_banner=.TRUE.
@@ -209,6 +231,13 @@ CONTAINS
     IF(x1.LE.1d-99.OR.x2.LE.1d-99.OR.x1.GT.1d0.OR.x2.GT.1d0)THEN
        PhotonPhotonFlux_pp=0d0
        RETURN
+    ENDIF
+    IF(gstate.NE.photon_final_state)THEN
+       ! a new grid for another final state
+       init=0
+       MX_save=0
+       MY_save=0
+       gstate=photon_final_state
     ENDIF
     IF(.NOT.PRESENT(FORCEPNOHAD1))THEN
        force_pnohad1=.FALSE.
@@ -273,6 +302,10 @@ CONTAINS
        ENDIF
        XD_1D(MX+1)=DBLE(log10xmin)
        YD_1D(MY+1)=DBLE(log10xmin)
+       IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+          ! the inelastic densities at all nodes and scales of the grid, one row per x
+          CALL pp_inelastic_prepare(MX+1,10d0**XD_1D,MY+1,10d0**YD_1D)
+       ENDIF
        DO I=1,MX+1
           xx1=10d0**(XD_1D(I))
           DO J=1,MY+1
@@ -382,11 +415,21 @@ CONTAINS
        ENDIF
     ENDIF
     ! Let us always evaluate PNOHAD=1 as a reference to compare
-    pnohadval=PhotonPhotonFlux_pp_eval(x1,x2,.TRUE.)
+    IF((photon_final_state.EQ.1.OR.photon_final_state.EQ.2).AND..NOT.force_pnohad1)THEN
+       ! the reference only checks the value (zero, NaN, sign): the elastic one (the collinear inelastic fluxes are
+       ! numerical, 2 per call)
+       gsel=photon_final_state
+       photon_final_state=0
+       pnohadval=PhotonPhotonFlux_pp_eval(x1,x2,.TRUE.)
+       photon_final_state=gsel
+    ELSE
+       pnohadval=PhotonPhotonFlux_pp_eval(x1,x2,.TRUE.)
+    ENDIF
     IF(.NOT.force_pnohad1)THEN
        IF(ISNAN(pnohadval).OR.pnohadval.EQ.0d0)THEN
           PhotonPhotonFlux_pp=0d0
-       ELSEIF(ISNAN(ZI(1)).OR.ZI(1).LT.0d0.OR.DABS(ZI(1)/pnohadval).GT.1D2)THEN
+       ELSEIF(ISNAN(ZI(1)).OR.ZI(1).LT.0d0.OR.&
+            (DABS(ZI(1)/pnohadval).GT.1D2.AND.photon_final_state.NE.1.AND.photon_final_state.NE.2))THEN
           PhotonPhotonFlux_pp=pnohadval
        ELSE
           PhotonPhotonFlux_pp=ZI(1)
@@ -432,7 +475,8 @@ CONTAINS
     INTEGER::printnum=0,iter
     SAVE printnum
     LOGICAL::force_pnohad1
-    REAL(KIND(1d0))::cmenergy
+    REAL(KIND(1d0))::cmenergy,el1,el2
+    INTEGER,DIMENSION(3)::subn
     IF(x1.LE.0d0.OR.x1.GE.1d0.OR.x2.LE.0d0.OR.x2.GE.1d0)THEN
        PhotonPhotonFlux_pp_eval=0d0
        RETURN
@@ -488,44 +532,57 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
-    IF(force_pnohad1)THEN
+    CALL set_photon_scale(x1,x2)
+    IF(force_pnohad1.OR.photon_final_state.EQ.3)THEN
        ! we only use PNOHAD=1
        IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
-          PhotonPhotonFlux_pp_eval=PhotonFlux_proton_ChFF_nob(x1_common,gamma1_common,proton_FF_correction)
-          PhotonPhotonFlux_pp_eval=PhotonPhotonFlux_pp_eval*&
-               PhotonFlux_proton_ChFF_nob(x2_common,gamma2_common,proton_FF_correction)
+          el1=PhotonFlux_proton_nob(x1_common,gamma1_common)
+          el2=PhotonFlux_proton_nob(x2_common,gamma2_common)
        ELSE
-          PhotonPhotonFlux_pp_eval=PhotonFlux_proton_EDFF_nob(x1_common,gamma1_common)
-          PhotonPhotonFlux_pp_eval=PhotonPhotonFlux_pp_eval*&
-               PhotonFlux_proton_EDFF_nob(x2_common,gamma2_common)
+          el1=PhotonFlux_proton_EDFF_nob(x1_common,gamma1_common)
+          el2=PhotonFlux_proton_EDFF_nob(x2_common,gamma2_common)
        ENDIF
+       PhotonPhotonFlux_pp_eval=final_state_nob(el1*ael_photon,el2*ael_photon,x1_common,x2_common,2)
        PhotonPhotonFlux_pp_eval=MAX(PhotonPhotonFlux_pp_eval,0d0)
        RETURN
+    ENDIF
+    IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+       CALL pp_inelastic_prepare(1,(/x1/),1,(/x2/))
     ENDIF
     ! we should choose the lower limit dynamically
     ! b1*x1*mproton = Exp(bA(1))
     aax(1)=DLOG(bfact*x1)
     ! b2*x2*mproton = Exp(bA(2))
     aax(2)=DLOG(bfact*x2)
-    CALL ROMBERG_ND(PhotonPhotonFlux_pp_fxn,aax,bbx,3,sub_num,1,1d-5,&
+    IF(USE_CHARGEFORMFACTOR4PHOTON.AND.USE_EXACT_ELASTIC4PHOTON)THEN
+       aax(1)=aax(1)+DLOG(EXACT_BLOW)
+       aax(2)=aax(2)+DLOG(EXACT_BLOW)
+    ENDIF
+    subn=sub_num
+    IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+       ! down to the b of the inelastic photons at large k_T
+       CALL pp_inelastic_range(x1,aax(1),subn(1))
+       CALL pp_inelastic_range(x2,aax(2),subn(2))
+    ENDIF
+    CALL ROMBERG_ND(PhotonPhotonFlux_pp_fxn,aax,bbx,3,subn,1,1d-5,&
          integral,ind,eval_num)
     IF(ind.EQ.-1)THEN
        WRITE(*,*)"WARNING: the precision 1e-5 is not achieved"
     ENDIF
-    IF(integral.LT.0d0)THEN
+    IF(integral.LT.0d0.AND.photon_final_state.NE.1)THEN
        ! try to rescue it by increasing bupper
        iter=1
        DO WHILE(integral.LT.0d0.AND.iter.LE.itermax)
           bbx(1)=bupper*2d0**(iter)
           bbx(2)=bupper*2d0**(iter)
-          CALL ROMBERG_ND(PhotonPhotonFlux_pp_fxn,aax,bbx,3,sub_num,1,1d-5,&
+          CALL ROMBERG_ND(PhotonPhotonFlux_pp_fxn,aax,bbx,3,subn,1,1d-5,&
                integral,ind,eval_num)
           iter=iter+1
        ENDDO
        bbx(1)=bupper
        bbx(2)=bupper
     ENDIF
-    IF(integral.LT.0d0)THEN
+    IF(integral.LT.0d0.AND.photon_final_state.NE.1)THEN
        printnum=printnum+1
        IF(printnum.LE.5)THEN
           WRITE(*,*)"WARNING: negative photon flux at (x1,x2)=",x1_common,x2_common
@@ -542,9 +599,27 @@ CONTAINS
           PhotonPhotonFlux_pp_eval=PhotonPhotonFlux_pp_eval*&
                PhotonFlux_proton_EDFF_nob(x2_common,gamma2_common)
        ENDIF
-       PhotonPhotonFlux_pp_eval=MAX(PhotonPhotonFlux_pp_eval,0d0)
+       PhotonPhotonFlux_pp_eval=MAX(PhotonPhotonFlux_pp_eval,0d0)*ael_photon**2
     ELSE
        PhotonPhotonFlux_pp_eval=TWOPI/(x1*x2)*alpha**2*Z1**2*Z2**2*integral
+       IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+          ! 1: (el-inel + inel-el) P = (el-inel + inel-el) - (el-inel + inel-el) (1-P), the first from the collinear
+          ! fluxes (the b integral of the inelastic photon rings with the sharp k_T < mu cut), the second, local in
+          ! b12, integrated above; 2: + inel-inel (P=1)
+          el1=0d0
+          el2=0d0
+          IF(photon_final_state.EQ.1)THEN
+             IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
+                el1=PhotonFlux_proton_nob(x1_common,gamma1_common)
+                el2=PhotonFlux_proton_nob(x2_common,gamma2_common)
+             ELSE
+                el1=PhotonFlux_proton_EDFF_nob(x1_common,gamma1_common)
+                el2=PhotonFlux_proton_EDFF_nob(x2_common,gamma2_common)
+             ENDIF
+          ENDIF
+          PhotonPhotonFlux_pp_eval=PhotonPhotonFlux_pp_eval+&
+               final_state_nob(el1*ael_photon,el2*ael_photon,x1_common,x2_common,2)
+       ENDIF
     ENDIF
     RETURN
   END FUNCTION PhotonPhotonFlux_pp_eval
@@ -916,6 +991,7 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    CALL set_photon_scale(x1,x2)
     ! we should choose the lower limit dynamically
     ! b1*x1*mproton = Exp(bA(1))
     aax(1)=DLOG(bfact*x1)
@@ -975,7 +1051,8 @@ CONTAINS
     ! bA(3) = theta_{12}
     REAL(KIND(1d0)),DIMENSION(dim_num),INTENT(IN)::bA
     REAL(KIND(1d0))::b1,b2,b12,costh,pnohad
-    REAL(KIND(1d0))::Ngamma1,Ngamma2
+    REAL(KIND(1d0))::Ngamma1,Ngamma2,Ninel1,Ninel2,blo_el
+    REAL(KIND(1d0)),PARAMETER::Rproton=0.877d0 ! as PhotonPhotonFlux_pp_eval
     !REAL(KIND(1d0)),PARAMETER::b0=19.8d0 ! in unit of GeV-2
     REAL(KIND(1d0))::b0_common ! in unit of GeV-2
     REAL(KIND(1d0))::gamma1_common,gamma2_common ! Lorentz boost factors
@@ -998,6 +1075,8 @@ CONTAINS
        costh=DCOS(bA(3))
        b12=DSQRT(b1**2+b2**2-2d0*b1*b2*costh)
        pnohad=PNOHAD_pp(b12,0d0,b0_common)
+       ! hadronic interaction (1 and 2: the parts with 1-P, see PhotonPhotonFlux_pp_eval)
+       IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)pnohad=1d0-pnohad
        IF(CALC_DELTABQ)THEN
           pnohad=pnohad*b12*GeVm12fm ! convert from GeV-1 to fm
        ENDIF
@@ -1024,18 +1103,42 @@ CONTAINS
        PhotonPhotonFlux_pp_fxn=0d0
        RETURN
     ENDIF
+    blo_el=0d0
+    IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+       ! the elastic photons on the b range of photon_final_state=0 (the lower limit of PhotonPhotonFlux_pp_eval);
+       ! the range is extended for the inelastic photons only (pp_inelastic_range)
+       blo_el=Rproton/GeVm12fm
+       IF(USE_CHARGEFORMFACTOR4PHOTON)blo_el=blo_el*LOWER_BFactor_Limit
+       IF(USE_CHARGEFORMFACTOR4PHOTON.AND.USE_EXACT_ELASTIC4PHOTON)blo_el=blo_el*EXACT_BLOW
+    ENDIF
+    Ngamma1=0d0
+    Ngamma2=0d0
     IF(.NOT.USE_CHARGEFORMFACTOR4PHOTON)THEN
        ! EDFF
-       Ngamma1=PhotonNumberDensity(b1,E1_common,gamma1_common)
-       Ngamma2=PhotonNumberDensity(b2,E2_common,gamma2_common)
+       IF(b1.GE.blo_el)Ngamma1=PhotonNumberDensity(b1,E1_common,gamma1_common)
+       IF(b2.GE.blo_el)Ngamma2=PhotonNumberDensity(b2,E2_common,gamma2_common)
     ELSE
        ! ChFF
-       Ngamma1=PhotonNumberDensity_ChargeFormFactor_proton(b1,E1_common,gamma1_common,&
-            proton_FF_correction)
-       Ngamma2=PhotonNumberDensity_ChargeFormFactor_proton(b2,E2_common,gamma2_common,&
-            proton_FF_correction)
+       IF(b1.GE.blo_el)Ngamma1=PhotonNumberDensity_proton(b1,E1_common,gamma1_common,1)
+       IF(b2.GE.blo_el)Ngamma2=PhotonNumberDensity_proton(b2,E2_common,gamma2_common,2)
     ENDIF
-    PhotonPhotonFlux_pp_fxn=b1**2*b2**2*pnohad*Ngamma1*Ngamma2
+    ! the elastic photons normalised to alpha(mu2) with running alpha (set_photon_scale; the nucleus photon has no
+    ! running alpha(Q2), Q2 <~ 1/R_A**2, only this normalisation)
+    Ngamma1=Ngamma1*ael_photon
+    Ngamma2=Ngamma2*ael_photon
+    IF(photon_final_state.EQ.0)THEN
+       PhotonPhotonFlux_pp_fxn=b1**2*b2**2*pnohad*Ngamma1*Ngamma2
+    ELSE
+       Ninel1=PhotonNumberDensity_inelastic_beam(b1,E1_common,gamma1_common,1)
+       Ninel2=PhotonNumberDensity_inelastic_beam(b2,E2_common,gamma2_common,2)
+       IF(photon_final_state.EQ.1)THEN
+          ! -(1-P) (el-inel + inel-el); (el-inel + inel-el) is added in PhotonPhotonFlux_pp_eval
+          PhotonPhotonFlux_pp_fxn=-b1**2*b2**2*pnohad*(Ngamma1*Ninel2+Ninel1*Ngamma2)
+       ELSE
+          ! 2: (1-P) (el-el + el-inel + inel-el); inel-inel (P=1) is added in PhotonPhotonFlux_pp_eval
+          PhotonPhotonFlux_pp_fxn=b1**2*b2**2*pnohad*(Ngamma1*Ngamma2+Ngamma1*Ninel2+Ninel1*Ngamma2)
+       ENDIF
+    ENDIF
     RETURN
   END FUNCTION PhotonPhotonFlux_pp_fxn
 
@@ -1462,6 +1565,7 @@ CONTAINS
 
   FUNCTION PhotonPhotonFlux_pA_WoodsSaxon(x1,x2,FORCEPNOHAD1)
     IMPLICIT NONE
+    include 'run90.inc'
     REAL(KIND(1d0))::PhotonPhotonFlux_pA_WoodsSaxon
     REAL(KIND(1d0)),INTENT(IN)::x1,x2
     LOGICAL,INTENT(IN),OPTIONAL::FORCEPNOHAD1
@@ -1489,6 +1593,8 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(1)::XI,YI,ZI
     REAL(KIND(1d0))::pnohadval
     LOGICAL::force_pnohad1
+    INTEGER::gstate=0,gsel
+    SAVE gstate
     IF(.NOT.print_banner)THEN
        include "banner.inc"
        print_banner=.TRUE.
@@ -1496,6 +1602,13 @@ CONTAINS
     IF(x1.LE.1d-99.OR.x2.LE.1d-99.OR.x1.GT.1d0.OR.x2.GT.1d0)THEN
        PhotonPhotonFlux_pA_WoodsSaxon=0d0
        RETURN
+    ENDIF
+    IF(gstate.NE.photon_final_state)THEN
+       ! a new grid for another final state
+       init=0
+       MX_save=0
+       MY_save=0
+       gstate=photon_final_state
     ENDIF
     IF(.NOT.PRESENT(FORCEPNOHAD1))THEN
        force_pnohad1=.FALSE.
@@ -1556,6 +1669,14 @@ CONTAINS
        ENDIF
        XD_1D(MX+1)=DBLE(log10xmin)
        YD_1D(MY+1)=DBLE(log10xmin)
+       IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+          ! the inelastic densities of the proton at all nodes and scales of the grid, one row per x
+          IF(nuclearA_beam1.NE.0)THEN
+             CALL pp_inelastic_prepare(MY+1,10d0**YD_1D,MX+1,10d0**XD_1D,.TRUE.)
+          ELSE
+             CALL pp_inelastic_prepare(MX+1,10d0**XD_1D,MY+1,10d0**YD_1D,.TRUE.)
+          ENDIF
+       ENDIF
        DO I=1,MX+1
           xx1=10d0**(XD_1D(I))
           DO J=1,MY+1
@@ -1661,11 +1782,20 @@ CONTAINS
        ENDIF
     ENDIF
     ! Let us always evaluate PNOHAD=1 as a reference to compare
-    pnohadval=PhotonPhotonFlux_pA_WoodsSaxon_eval(x1,x2,.TRUE.)
+    IF((photon_final_state.EQ.1.OR.photon_final_state.EQ.2).AND..NOT.force_pnohad1)THEN
+       ! the reference only checks the value (zero, NaN, sign): the elastic one (as PhotonPhotonFlux_pp)
+       gsel=photon_final_state
+       photon_final_state=0
+       pnohadval=PhotonPhotonFlux_pA_WoodsSaxon_eval(x1,x2,.TRUE.)
+       photon_final_state=gsel
+    ELSE
+       pnohadval=PhotonPhotonFlux_pA_WoodsSaxon_eval(x1,x2,.TRUE.)
+    ENDIF
     IF(.NOT.force_pnohad1)THEN
        IF(ISNAN(pnohadval).OR.pnohadval.EQ.0d0)THEN
           PhotonPhotonFlux_pA_WoodsSaxon=0d0
-       ELSEIF(ISNAN(ZI(1)).OR.ZI(1).LT.0d0.OR.DABS(ZI(1)/pnohadval).GT.1D2)THEN
+       ELSEIF(ISNAN(ZI(1)).OR.ZI(1).LT.0d0.OR.&
+            (DABS(ZI(1)/pnohadval).GT.1D2.AND.photon_final_state.NE.1.AND.photon_final_state.NE.2))THEN
           PhotonPhotonFlux_pA_WoodsSaxon=pnohadval
        ELSE
           PhotonPhotonFlux_pA_WoodsSaxon=ZI(1)
@@ -1717,9 +1847,15 @@ CONTAINS
     INTEGER::printnum=0,iter
     SAVE printnum
     LOGICAL::force_pnohad1
+    REAL(KIND(1d0))::elp,elA
+    INTEGER,DIMENSION(3)::subn
     IF(x1.LE.0d0.OR.x1.GE.1d0.OR.x2.LE.0d0.OR.x2.GE.1d0)THEN
        PhotonPhotonFlux_pA_WoodsSaxon_eval=0d0
        RETURN
+    ENDIF
+    IF(photon_final_state.NE.0.AND.ANY(neutron_tagging.NE.-2))THEN
+       WRITE(*,*)"ERROR: photon_final_state /= 0 is not available with neutron tagging"
+       STOP
     ENDIF
     CALC_DELTABQ=.FALSE.
     IF(init.EQ.0)THEN
@@ -1800,35 +1936,43 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
-    IF(force_pnohad1)THEN
+    CALL set_photon_scale(x1,x2)
+    IF(force_pnohad1.OR.photon_final_state.EQ.3)THEN
        ! we only use PNOHAD=1
        IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
-          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonFlux_proton_ChFF_nob(x1_common,&
-               gamma1_common,proton_FF_correction)
-          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonPhotonFlux_pA_WoodsSaxon_eval*&
-            PhotonFlux_nucleus_ChFF_nob(2,x2_common,gamma2_common,Z2,RA_common,wVal_common,aaVal_common)
+          elp=PhotonFlux_proton_nob(x1_common,gamma1_common)
+          elA=PhotonFlux_nucleus_ChFF_nob(2,x2_common,gamma2_common,Z2,RA_common,wVal_common,aaVal_common)
        ELSE
-          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonFlux_proton_EDFF_nob(x1_common,&
-               gamma1_common)
-          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonPhotonFlux_pA_WoodsSaxon_eval*&
-               PhotonFlux_nucleus_EDFF_nob(x2_common,gamma2_common,Z2,RA_common)
+          elp=PhotonFlux_proton_EDFF_nob(x1_common,gamma1_common)
+          elA=PhotonFlux_nucleus_EDFF_nob(x2_common,gamma2_common,Z2,RA_common)
        ENDIF
+       ! (only the proton, beam 1 here, has an inelastic photon)
+       PhotonPhotonFlux_pA_WoodsSaxon_eval=final_state_nob(elp*ael_photon,elA*ael_photon,x1_common,x2_common,1)
        PhotonPhotonFlux_pA_WoodsSaxon_eval=MAX(PhotonPhotonFlux_pA_WoodsSaxon_eval,0d0)
        RETURN
+    ENDIF
+    IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+       CALL pp_inelastic_prepare(1,(/x1_common/),1,(/x2_common/),.TRUE.)
     ENDIF
     ! we should choose the lower limit dynamically
     ! b1*x1*mproton = Exp(bA(1))
     aax(1)=DLOG(bfact1*x1_common)
+    IF(USE_CHARGEFORMFACTOR4PHOTON.AND.USE_EXACT_ELASTIC4PHOTON)aax(1)=aax(1)+DLOG(EXACT_BLOW) ! as pp
     ! b2*x2*mN = Exp(bA(2))
     aax(2)=DLOG(bfact2*x2_common)
     ! we should also choose the upper limit dynamically for the ion beam
     bbx(2)=MAX(1.5d0,DLOG(0.8d0*RA_common/GeVm12fm*DSQRT(x2_common*mN)))
-    CALL ROMBERG_ND(PhotonPhotonFlux_pA_WoodsSaxon_fxn,aax,bbx,3,sub_num,1,1d-5,&
+    subn=sub_num
+    IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+       ! the proton b range down to the b of its inelastic photons at large k_T (as pp)
+       CALL pp_inelastic_range(x1_common,aax(1),subn(1))
+    ENDIF
+    CALL ROMBERG_ND(PhotonPhotonFlux_pA_WoodsSaxon_fxn,aax,bbx,3,subn,1,1d-5,&
          integral,ind,eval_num)
     IF(ind.EQ.-1)THEN
        WRITE(*,*)"WARNING: the precision 1e-5 is not achieved"
     ENDIF
-    IF(integral.LT.0d0)THEN
+    IF(integral.LT.0d0.AND.photon_final_state.NE.1)THEN
        ! try to rescue it by increasing bupper
        iter=1
        DO WHILE(integral.LT.0d0.AND.iter.LE.itermax)
@@ -1836,7 +1980,7 @@ CONTAINS
           !bbx(2)=bupper*2d0**(iter)
           bbx(1)=bbx(1)*2d0
           bbx(2)=bbx(2)*2d0
-          CALL ROMBERG_ND(PhotonPhotonFlux_pA_WoodsSaxon_fxn,aax,bbx,3,sub_num,1,1d-5,&
+          CALL ROMBERG_ND(PhotonPhotonFlux_pA_WoodsSaxon_fxn,aax,bbx,3,subn,1,1d-5,&
                integral,ind,eval_num)
           iter=iter+1
        ENDDO
@@ -1844,7 +1988,7 @@ CONTAINS
        !bbx(2)=bupper
        bbx(2)=MAX(1.5d0,DLOG(0.8d0*RA_common/GeVm12fm*DSQRT(x2_common*mN)))
     ENDIF
-    IF(integral.LT.0d0)THEN
+    IF(integral.LT.0d0.AND.photon_final_state.NE.1)THEN
        printnum=printnum+1
        IF(printnum.LE.5)THEN
           WRITE(*,*)"WARNING: negative photon flux at (x1,x2)=",x1_common,x2_common
@@ -1853,8 +1997,7 @@ CONTAINS
        ENDIF
        IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
           ! for approximation
-          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonFlux_proton_ChFF_nob(x1_common,&
-               gamma1_common,proton_FF_correction)
+          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonFlux_proton_nob(x1_common,gamma1_common)
           PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonPhotonFlux_pA_WoodsSaxon_eval*&
             PhotonFlux_nucleus_ChFF_nob(2,x2_common,gamma2_common,Z2,RA_common,wVal_common,aaVal_common)
        ELSE
@@ -1863,9 +2006,20 @@ CONTAINS
           PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonPhotonFlux_pA_WoodsSaxon_eval*&
                PhotonFlux_nucleus_EDFF_nob(x2_common,gamma2_common,Z2,RA_common)
        ENDIF
-       PhotonPhotonFlux_pA_WoodsSaxon_eval=MAX(PhotonPhotonFlux_pA_WoodsSaxon_eval,0d0)
+       PhotonPhotonFlux_pA_WoodsSaxon_eval=MAX(PhotonPhotonFlux_pA_WoodsSaxon_eval,0d0)*ael_photon**2
     ELSE
        PhotonPhotonFlux_pA_WoodsSaxon_eval=TWOPI/(x1*x2)*alpha**2*Z1**2*Z2**2*integral
+       IF(photon_final_state.EQ.1)THEN
+          ! 1: inel-el P = inel-el - inel-el (1-P), the first from the collinear fluxes, the second integrated above
+          ! (as pp); 2: no inel-inel in pA (the nucleus is elastic only)
+          IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
+             elA=PhotonFlux_nucleus_ChFF_nob(2,x2_common,gamma2_common,Z2,RA_common,wVal_common,aaVal_common)
+          ELSE
+             elA=PhotonFlux_nucleus_EDFF_nob(x2_common,gamma2_common,Z2,RA_common)
+          ENDIF
+          PhotonPhotonFlux_pA_WoodsSaxon_eval=PhotonPhotonFlux_pA_WoodsSaxon_eval+&
+               final_state_nob(0d0,elA*ael_photon,x1_common,x2_common,1)
+       ENDIF
     ENDIF
     RETURN
   END FUNCTION PhotonPhotonFlux_pA_WoodsSaxon_eval
@@ -2269,6 +2423,7 @@ CONTAINS
     ELSE
        force_pnohad1=FORCEPNOHAD1
     ENDIF
+    CALL set_photon_scale(x1,x2)
     ! we should choose the lower limit dynamically
     ! b1*x1*mproton = Exp(bA(1))
     aax(1)=DLOG(bfact1*x1_common)
@@ -2335,7 +2490,8 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(dim_num),INTENT(IN)::bA
     REAL(KIND(1d0))::b1,b2,b12,costh,pnohad
     REAL(KIND(1d0))::b12GeVm1,pbreak
-    REAL(KIND(1d0))::Ngamma1,Ngamma2
+    REAL(KIND(1d0))::Ngamma1,Ngamma2,Ninel1,blo_el
+    REAL(KIND(1d0)),PARAMETER::Rproton=0.877d0 ! as PhotonPhotonFlux_pA_WoodsSaxon_eval
     REAL(KIND(1d0))::gamma1_common,gamma2_common ! Lorentz boost factors
     REAL(KIND(1d0))::E1_common,E2_common      ! energies of two photons
     REAL(KIND(1d0))::x1_common,x2_common      ! x1 and x2 of two photons
@@ -2380,6 +2536,8 @@ CONTAINS
              pnohad=pnohad*pbreak
           ENDIF
        ENDIF
+       ! hadronic interaction (1 and 2: the parts with 1-P, see PhotonPhotonFlux_pA_WoodsSaxon_eval)
+       IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)pnohad=1d0-pnohad
        IF(CALC_DELTABQ)THEN
           pnohad=pnohad*b12
        ENDIF
@@ -2406,26 +2564,51 @@ CONTAINS
        PhotonPhotonFlux_pA_WoodsSaxon_fxn=0d0
        RETURN
     ENDIF
+    blo_el=0d0
+    IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
+       ! the elastic proton photon on the b range of photon_final_state=0 (as pp); the range is extended for the
+       ! inelastic photon only (pp_inelastic_range)
+       blo_el=Rproton/GeVm12fm
+       IF(USE_CHARGEFORMFACTOR4PHOTON)blo_el=blo_el*LOWER_BFactor_Limit
+       IF(USE_CHARGEFORMFACTOR4PHOTON.AND.USE_EXACT_ELASTIC4PHOTON)blo_el=blo_el*EXACT_BLOW
+    ENDIF
     IF(.NOT.USE_CHARGEFORMFACTOR4PHOTON)THEN
-       Ngamma1=PhotonNumberDensity(b1,E1_common,gamma1_common)
+       Ngamma1=0d0
+       IF(b1.GE.blo_el)Ngamma1=PhotonNumberDensity(b1,E1_common,gamma1_common)
        Ngamma2=PhotonNumberDensity(b2,E2_common,gamma2_common)
     ELSE
        ! converting from fm to GeV-1
        RR=RA_common/GeVm12fm
        aaa=aaVal_common/GeVm12fm
-       IF(nuclearA_beam1.NE.0)THEN
+       IF(nuclearA_beam1.NE.0.AND..NOT.USE_EXACT_ELASTIC4PHOTON.AND.photon_final_state.EQ.0)THEN
           Ngamma1=PhotonNumberDensity_ChargeFormFactor_WS(b1,E1_common,gamma1_common,&
                RR,wVal_common,aaa,3d0,0.7d0,1)
           Ngamma2=PhotonNumberDensity_ChargeFormFactor_proton(b2,E2_common,gamma2_common,&
                proton_FF_correction)
        ELSE
-          Ngamma1=PhotonNumberDensity_ChargeFormFactor_proton(b1,E1_common,gamma1_common,&
-               proton_FF_correction)
+          ! the proton is beam 1 (also for A+p, see PhotonPhotonFlux_pA_WoodsSaxon_eval)
+          Ngamma1=0d0
+          IF(b1.GE.blo_el)Ngamma1=PhotonNumberDensity_proton(b1,E1_common,gamma1_common,1)
           Ngamma2=PhotonNumberDensity_ChargeFormFactor_WS(b2,E2_common,gamma2_common,&
                RR,wVal_common,aaa,3d0,0.7d0,2)
        ENDIF
     ENDIF
-    PhotonPhotonFlux_pA_WoodsSaxon_fxn=b1**2*b2**2*pnohad*Ngamma1*Ngamma2
+    ! the elastic photons normalised to alpha(mu2) with running alpha (set_photon_scale; the nucleus photon has no
+    ! running alpha(Q2), Q2 <~ 1/R_A**2, only this normalisation)
+    Ngamma1=Ngamma1*ael_photon
+    Ngamma2=Ngamma2*ael_photon
+    IF(photon_final_state.EQ.0)THEN
+       PhotonPhotonFlux_pA_WoodsSaxon_fxn=b1**2*b2**2*pnohad*Ngamma1*Ngamma2
+    ELSE
+       Ninel1=PhotonNumberDensity_inelastic_beam(b1,E1_common,gamma1_common,1)
+       IF(photon_final_state.EQ.1)THEN
+          ! -(1-P) inel-el; inel-el is added in PhotonPhotonFlux_pA_WoodsSaxon_eval
+          PhotonPhotonFlux_pA_WoodsSaxon_fxn=-b1**2*b2**2*pnohad*Ninel1*Ngamma2
+       ELSE
+          ! 2: (1-P) (el-el + inel-el)
+          PhotonPhotonFlux_pA_WoodsSaxon_fxn=b1**2*b2**2*pnohad*(Ngamma1+Ninel1)*Ngamma2
+       ENDIF
+    ENDIF
     RETURN
   END FUNCTION PhotonPhotonFlux_pA_WoodsSaxon_fxn
 
@@ -3819,6 +4002,10 @@ CONTAINS
     INTEGER::collision_type_common,profile_type_common
     COMMON/Lgammagamma_UPC_com/collision_type_common,profile_type_common,&
          tau_common
+    IF(photon_final_state.NE.0.AND.(icoll.EQ.3.OR.(icoll.EQ.2.AND.iprofile.EQ.2)))THEN
+       WRITE(*,*)"ERROR: photon_final_state /= 0 is only available for pp and pA (Woods-Saxon)"
+       STOP
+    ENDIF
     s=4d0*ebeam(1)*ebeam(2)
     tau_common=scale**2/s
     collision_type_common=icoll
@@ -7971,4 +8158,263 @@ CONTAINS
     RETURN
   END SUBROUTINE BOOSTFROMECM
 
+  FUNCTION PhotonNumberDensity_proton(b,Ega,gamma,ibeam)
+    ! the proton photon number density with ChFF (Z=1, alpha=1): small-x approximation
+    ! (PhotonNumberDensity_ChargeFormFactor_proton) or not (USE_EXACT_ELASTIC4PHOTON),
+    ! with the form factors of proton_FF_correction; the last value of each beam (ibeam) is kept
+    IMPLICIT NONE
+    REAL(KIND(1d0))::PhotonNumberDensity_proton
+    REAL(KIND(1d0)),INTENT(IN)::b,Ega,gamma
+    INTEGER,INTENT(IN)::ibeam
+    REAL(KIND(1d0)),DIMENSION(4,2)::last=-1d0 ! b,Ega,gamma,value
+    INTEGER,DIMENSION(2)::lastset=-1 ! the switches of last
+    SAVE last,lastset
+    INTEGER::set
+    set=proton_FF_correction+MERGE(10,0,USE_EXACT_ELASTIC4PHOTON)+MERGE(100,0,alpha_running4photon)
+    IF(ALL(last(1:3,ibeam).EQ.(/b,Ega,gamma/)).AND.lastset(ibeam).EQ.set)THEN
+       PhotonNumberDensity_proton=last(4,ibeam)
+       RETURN
+    ENDIF
+    IF(USE_EXACT_ELASTIC4PHOTON)THEN
+       PhotonNumberDensity_proton=PhotonNumberDensity_ChargeFormFactor_proton_exact(b,Ega,gamma,proton_FF_correction)
+    ELSE
+       PhotonNumberDensity_proton=PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,proton_FF_correction)
+    ENDIF
+    last(:,ibeam)=(/b,Ega,gamma,PhotonNumberDensity_proton/)
+    lastset(ibeam)=set
+    RETURN
+  END FUNCTION PhotonNumberDensity_proton
+
+  FUNCTION PhotonFlux_proton_nob(x,gamma)
+    ! the proton photon flux with ChFF and PNOHAD=1, as PhotonNumberDensity_proton (it depends on x only);
+    ! with GENERATE_PROTON_FLUX_GRID, in the exact distribution or with running alpha (numerical integrals), for
+    ! XGMIN<=x<=XGMAX from a cubic spline of log(x*dN/dx) in log(x/(1-x)) (NG nodes; log(x) at small x, log(1-x)
+    ! near 1, where the flux vanishes), built at the first call with the current switches; for XGMAX<x<=XHMAX from a
+    ! second spline (NH nodes, half the spacing, from NHO nodes below XGMAX to NHO nodes above XHMAX, so that its
+    ! end conditions are outside the range where it is used; grid/direct-1 <= 2e-6, all switches), built when first
+    ! needed; direct otherwise (x > XHMAX: only the end point x = 1 of the luminosity integrals)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::PhotonFlux_proton_nob
+    REAL(KIND(1d0)),INTENT(IN)::x,gamma
+    INTEGER,PARAMETER::NG=361 ! 40 nodes per decade at small x
+    REAL(KIND(1d0)),PARAMETER::XGMIN=1d-9,XGMAX=0.9d0,XHMAX=0.9999d0
+    INTEGER,PARAMETER::NHO=10,NH=242 ! (logit(XHMAX)-logit(XGMAX))/(spacing/2) = 220.3, +2 NHO, +1
+    REAL(KIND(1d0)),DIMENSION(NG)::lx,ly,cb,cc,cd
+    REAL(KIND(1d0)),DIMENSION(NH)::hx,hy,hb,hc,hd
+    INTEGER::gset=-1,hset=-1,set,i
+    REAL(KIND(1d0))::dl
+    SAVE lx,ly,cb,cc,cd,gset,hx,hy,hb,hc,hd,hset
+    IF(x.LT.XGMIN.OR.x.GT.XHMAX.OR..NOT.GENERATE_PROTON_FLUX_GRID.OR.&
+         .NOT.(USE_EXACT_ELASTIC4PHOTON.OR.alpha_running4photon))THEN
+       PhotonFlux_proton_nob=direct(x)
+       RETURN
+    ENDIF
+    set=proton_FF_correction+MERGE(10,0,USE_EXACT_ELASTIC4PHOTON)+MERGE(100,0,alpha_running4photon)
+    dl=(logit(XGMAX)-logit(XGMIN))/(NG-1)
+    IF(x.GT.XGMAX)THEN
+       IF(hset.NE.set)THEN
+          DO i=1,NH
+             hx(i)=logit(XGMAX)+(i-1-NHO)*0.5d0*dl
+             hy(i)=DLOG(xoft(hx(i))*direct(xoft(hx(i))))
+          ENDDO
+          CALL spline(hx,hy,hb,hc,hd,NH)
+          hset=set
+       ENDIF
+       PhotonFlux_proton_nob=DEXP(ispline(logit(x),hx,hy,hb,hc,hd,NH))/x
+       RETURN
+    ENDIF
+    IF(gset.NE.set)THEN
+       DO i=1,NG
+          lx(i)=logit(XGMIN)+(i-1)*(logit(XGMAX)-logit(XGMIN))/(NG-1)
+          ly(i)=DLOG(xoft(lx(i))*direct(xoft(lx(i))))
+       ENDDO
+       CALL spline(lx,ly,cb,cc,cd,NG)
+       gset=set
+    ENDIF
+    PhotonFlux_proton_nob=DEXP(ispline(logit(x),lx,ly,cb,cc,cd,NG))/x
+    RETURN
+  CONTAINS
+    FUNCTION direct(xx)
+      REAL(KIND(1d0))::direct
+      REAL(KIND(1d0)),INTENT(IN)::xx
+      IF(USE_EXACT_ELASTIC4PHOTON)THEN
+         direct=PhotonFlux_proton_ChFF_exact_nob(xx,proton_FF_correction)
+      ELSE
+         direct=PhotonFlux_proton_ChFF_nob(xx,gamma,proton_FF_correction)
+      ENDIF
+    END FUNCTION direct
+    FUNCTION logit(xx)
+      REAL(KIND(1d0))::logit
+      REAL(KIND(1d0)),INTENT(IN)::xx
+      logit=DLOG(xx/(1d0-xx))
+    END FUNCTION logit
+    FUNCTION xoft(t) ! inverse of logit
+      REAL(KIND(1d0))::xoft
+      REAL(KIND(1d0)),INTENT(IN)::t
+      xoft=1d0/(1d0+DEXP(-t))
+    END FUNCTION xoft
+  END FUNCTION PhotonFlux_proton_nob
+
+
+  FUNCTION photon_mu2(x1,x2)
+    ! the scale of the inelastic photons in pp: mu = W_gammagamma, mu2 = x1 x2 s (GeV^2)
+    IMPLICIT NONE
+    include 'run90.inc'
+    REAL(KIND(1d0))::photon_mu2
+    REAL(KIND(1d0)),INTENT(IN)::x1,x2
+    photon_mu2=x1*x2*(4d0*ebeam(1)*ebeam(2))
+  END FUNCTION photon_mu2
+
+  SUBROUTINE set_photon_scale(x1,x2)
+    ! the scale mu2_photon of the photon-photon flux at (x1,x2) and, with alpha_running4photon, the normalisation
+    ! alpha(0)/alpha(mu2) of the elastic photons (ael_photon), as the inelastic photon (LUXqed, MSbar at mu): every
+    ! photon then carries alpha(Q2)**2/alpha(mu2) and the hard process uses alpha(mu2); fixed alpha: 1, alpha(0)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x1,x2
+    mu2_photon=photon_mu2(x1,x2)
+    ael_photon=alpha_norm_mu(mu2_photon)
+  END SUBROUTINE set_photon_scale
+
+  FUNCTION final_state_nob(el1,el2,x1,x2,np)
+    ! d2N/dx1dx2 with P_NOHAD=1 for photon_final_state, from the elastic dN/dx el1, el2 and the inelastic ones at
+    ! mu2_photon (for 2 only inel-inel: 1-P=0); np = 2: pp, np = 1: pA with the proton as beam 1 (no inelastic
+    ! photon of the nucleus)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::final_state_nob
+    REAL(KIND(1d0)),INTENT(IN)::el1,el2,x1,x2
+    INTEGER,INTENT(IN)::np
+    REAL(KIND(1d0))::in1,in2
+    IF(photon_final_state.EQ.0)THEN
+       final_state_nob=el1*el2
+       RETURN
+    ENDIF
+    in1=PhotonFlux_proton_inelastic_nob(x1,mu2_photon)
+    in2=0d0
+    IF(np.EQ.2)in2=PhotonFlux_proton_inelastic_nob(x2,mu2_photon)
+    SELECT CASE(photon_final_state)
+    CASE(1)
+       final_state_nob=el1*in2+in1*el2
+    CASE(2)
+       final_state_nob=in1*in2
+    CASE DEFAULT
+       final_state_nob=(el1+in1)*(el2+in2)
+    END SELECT
+  END FUNCTION final_state_nob
+
+  FUNCTION PhotonNumberDensity_inelastic_beam(b,Ega,gamma,ibeam)
+    ! the inelastic proton photon density (Z=1, alpha=1) at mu2_photon; the last value of each beam (ibeam) is kept
+    IMPLICIT NONE
+    REAL(KIND(1d0))::PhotonNumberDensity_inelastic_beam
+    REAL(KIND(1d0)),INTENT(IN)::b,Ega,gamma
+    INTEGER,INTENT(IN)::ibeam
+    REAL(KIND(1d0)),DIMENSION(5,2)::last=-1d0 ! b,Ega,gamma,mu2,value
+    SAVE last
+    IF(ALL(last(1:4,ibeam).EQ.(/b,Ega,gamma,mu2_photon/)))THEN
+       PhotonNumberDensity_inelastic_beam=last(5,ibeam)
+       RETURN
+    ENDIF
+    PhotonNumberDensity_inelastic_beam=PhotonNumberDensity_inelastic_proton(b,Ega,gamma,mu2_photon)
+    last(:,ibeam)=(/b,Ega,gamma,mu2_photon,PhotonNumberDensity_inelastic_beam/)
+  END FUNCTION PhotonNumberDensity_inelastic_beam
+
+  SUBROUTINE pp_inelastic_prepare(n1,x1s,n2,x2s,ONLYBEAM1)
+    ! ONLYBEAM1 (pA, the proton as beam 1): only the rows of beam 1
+    ! fills the rows of the inelastic densities of beam 1 at x1s and of beam 2 at x2s at the
+    ! b nodes of PhotonPhotonFlux_pp_eval (midpoints of the panels in ln(x b mproton), pp_inelastic_range, up to bupper)
+    ! and the scales photon_mu2 of all pairs, in one call (inel_fast_prepare_rows: parallel with OpenMP); the values are
+    ! those computed on demand otherwise
+    IMPLICIT NONE
+    include 'run90.inc'
+    INTEGER,INTENT(IN)::n1,n2
+    REAL(KIND(1d0)),DIMENSION(n1),INTENT(IN)::x1s
+    REAL(KIND(1d0)),DIMENSION(n2),INTENT(IN)::x2s
+    LOGICAL,INTENT(IN),OPTIONAL::ONLYBEAM1
+    ! as in PhotonPhotonFlux_pp_eval
+    REAL(KIND(1d0)),PARAMETER::mproton=0.938272081d0,bupper=2d0
+    REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::bv,mu2v
+    REAL(KIND(1d0)),DIMENSION(n1+n2)::xr
+    INTEGER,DIMENSION(n1+n2)::nbr,nmr
+    REAL(KIND(1d0))::alo,a,gamma
+    INTEGER::nsub,ib,i,j,k,nr,ldb,nbeam
+    nbeam=2
+    IF(PRESENT(ONLYBEAM1))THEN
+       IF(ONLYBEAM1)nbeam=1
+    ENDIF
+    ldb=0
+    DO i=1,MERGE(n1+n2,n1,nbeam.EQ.2)
+       IF(i.LE.n1)THEN
+          a=x1s(i)
+       ELSE
+          a=x2s(i-n1)
+       ENDIF
+       IF(a.LE.0d0.OR.a.GE.1d0)CYCLE
+       CALL pp_inelastic_range(a,alo,nsub)
+       ldb=MAX(ldb,nsub)
+    ENDDO
+    IF(ldb.EQ.0)RETURN
+    ALLOCATE(bv(ldb,n1+n2),mu2v(MAX(n1,n2),n1+n2))
+    nr=0
+    DO ib=1,nbeam
+       gamma=ebeam(ib)/mproton
+       DO i=1,MERGE(n1,n2,ib.EQ.1)
+          IF(ib.EQ.1)THEN
+             a=x1s(i)
+          ELSE
+             a=x2s(i)
+          ENDIF
+          IF(a.LE.0d0.OR.a.GE.1d0)CYCLE
+          nr=nr+1
+          ! x as in PhotonNumberDensity_inelastic_proton: Ega/(gamma mp)
+          xr(nr)=(ebeam(ib)*a)/(gamma*mproton)
+          CALL pp_inelastic_range(a,alo,nsub)
+          nbr(nr)=nsub
+          DO k=1,nsub
+             bv(k,nr)=DEXP((DBLE(2*nsub-2*k+1)*alo+DBLE(2*k-1)*bupper)/DBLE(2*nsub))/a/mproton
+          ENDDO
+          nmr(nr)=0
+          DO j=1,MERGE(n2,n1,ib.EQ.1)
+             IF(ib.EQ.1)THEN
+                IF(x2s(j).LE.0d0.OR.x2s(j).GE.1d0)CYCLE
+                nmr(nr)=nmr(nr)+1; mu2v(nmr(nr),nr)=photon_mu2(a,x2s(j))
+             ELSE
+                IF(x1s(j).LE.0d0.OR.x1s(j).GE.1d0)CYCLE
+                nmr(nr)=nmr(nr)+1; mu2v(nmr(nr),nr)=photon_mu2(x1s(j),a)
+             ENDIF
+          ENDDO
+          IF(nmr(nr).EQ.0)nr=nr-1
+       ENDDO
+    ENDDO
+    IF(nr.GT.0)CALL inel_fast_prepare_rows(nr,xr(1:nr),ldb,nbr(1:nr),bv(:,1:nr),MAX(n1,n2),nmr(1:nr),mu2v(:,1:nr))
+  END SUBROUTINE pp_inelastic_prepare
+
+  SUBROUTINE pp_inelastic_range(x,alo,nsub)
+    ! photon_final_state 1, 2: the lower limit alo of ln(x b mproton) in PhotonPhotonFlux_pp_eval, down to
+    ! b = 1d-3/mu_max (mu_max = sqrt(x s), the largest W at this x), as the inelastic photon at k_T ~ mu lives at
+    ! b ~ 1/mu, and the number of midpoint panels nsub, of width at most 0.25 (the midpoint rule in ln b converges as
+    ! exp(-pi^2/width) for these integrands), with the old lower limit (where the elastic photon stops in
+    ! PhotonPhotonFlux_pp_fxn) as a panel edge; it depends on x only
+    IMPLICIT NONE
+    include 'run90.inc'
+    REAL(KIND(1d0)),INTENT(IN)::x
+    REAL(KIND(1d0)),INTENT(OUT)::alo
+    INTEGER,INTENT(OUT)::nsub
+    ! as in PhotonPhotonFlux_pp_eval
+    REAL(KIND(1d0)),PARAMETER::mproton=0.938272081d0,Rproton=0.877d0,bupper=2d0
+    REAL(KIND(1d0))::bfact,a0,h
+    INTEGER::m,k
+    bfact=Rproton/GeVm12fm*mproton
+    nsub=30
+    IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
+       bfact=bfact*LOWER_BFactor_Limit
+       nsub=nsub*SUB_FACTOR
+    ENDIF
+    a0=DLOG(bfact*x)
+    IF(USE_CHARGEFORMFACTOR4PHOTON.AND.USE_EXACT_ELASTIC4PHOTON)a0=a0+DLOG(EXACT_BLOW) ! as PhotonPhotonFlux_pp_eval
+    m=CEILING((bupper-a0)/0.25d0-1d-9)
+    h=(bupper-a0)/m
+    alo=MIN(a0,DLOG(x*mproton*1d-3/DSQRT(x*4d0*ebeam(1)*ebeam(2))))
+    k=CEILING((a0-alo)/h-1d-9)
+    alo=a0-k*h
+    nsub=m+k
+  END SUBROUTINE pp_inelastic_range
 END MODULE PhotonPhotonFlux
