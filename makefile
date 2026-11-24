@@ -57,16 +57,16 @@ test.o: test.f90 PhotonPhotonFlux.o OpticalGlauber_Geometry.o
 PhotonPhotonFlux.o: PhotonPhotonFlux.f90 ElasticFlux.o InelasticFlux.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o photoabsorption.o
 	$(FC) $(FFLAGS) -c $<
 
-ElasticFlux.o: ElasticFlux.f90 proton_A1_formfactors.inc alpha_running_poles.inc bessel_integration.o alpha_running.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o
+ElasticFlux.o: ElasticFlux.f90 bessel_integration.o alpha_running.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o
 	$(FC) $(FFLAGS) -c $<
 
 bessel_integration.o: bessel_integration.f90
 	$(FC) $(FFLAGS) -c $<
 
-structure_functions.o: structure_functions.f90 clas_spline.inc interpolation.o ElasticFlux.o
+structure_functions.o: structure_functions.f90 ElasticFlux.o
 	$(FC) $(FFLAGS) -c $<
 
-InelasticFlux.o: InelasticFlux.f90 ElasticFlux.o alpha_running.o structure_functions.o bessel_integration.o interpolation.o
+InelasticFlux.o: InelasticFlux.f90 ElasticFlux.o OpticalGlauber_Geometry.o alpha_running.o structure_functions.o bessel_integration.o interpolation.o
 	$(FC) $(FFLAGS) -c $<
 
 lhapdf_stub.o: lhapdf_stub.f90

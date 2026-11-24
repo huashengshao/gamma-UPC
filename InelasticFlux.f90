@@ -16,6 +16,7 @@ MODULE InelasticFlux
   USE ElasticFlux,ONLY:proton_exact_kspace,proton_exact_edges,proton_exact_comb_P,&
        mproton,alphaem_elasticphoton,aqedup,alpha_running4photon,GENERATE_PROTON_FLUX_GRID
   USE alpha_running,ONLY:alpha_ratio_tab
+  USE OpticalGlauber_Geometry,ONLY:ChargeFormFactor_WoodsSaxon
   USE structure_functions,ONLY:F2_FL_h,mpi,W2lo,W2hi,Q2_pdf,Q2_pdf_ramp,rho_W2,low_Q2_model,sf_check,sf_version,&
        sf_pdf_id,sf_xc,sf_Q2c
   USE bessel_integration,ONLY:bessel_integrate_finite,sort_unique
@@ -36,7 +37,7 @@ MODULE InelasticFlux
   PUBLIC::inel_fast_prepare,inel_fast_prepare_rows
   ! two-dimensional Fourier transforms of the b-space densities (momentum space, the (1-P) parts of the final states of
   ! PhotonPhotonFlux)
-  PUBLIC::inel_rhohat,elastic_rhohat,inel_rhohat_key
+  PUBLIC::inel_rhohat,elastic_rhohat,inel_rhohat_key,nucleus_rhohat
   LOGICAL,PARAMETER::rhohat_fast=.TRUE. ! rho_phat_fast in inel_rhohat (.FALSE.: rho_phat_mu, the reference)
   REAL(KIND(1d0)),PARAMETER::rhohat_kb2=30d0 ! (M12) bands of cuts rhohat_kb2 D <= kc < rhohat_kb D to O(D^2) (<= 1e-6)
   REAL(KIND(1d0)),PARAMETER::rhohat_kb=300d0 ! bands of cuts kc >= rhohat_kb D at leading order (<= 1.4e-6)
@@ -48,7 +49,7 @@ MODULE InelasticFlux
   ! inel_cache_hits, inel_cache_writes: blocks read from and written to the cache in this run
   CHARACTER(LEN=512),PUBLIC::inel_cache_dir='.'
   INTEGER,PUBLIC::inel_cache_hits=0,inel_cache_writes=0
-  INTEGER,PARAMETER::CACHE_VERSION=1
+  INTEGER,PARAMETER::CACHE_VERSION=2 ! 2 (M15): rho_row without the Delta^2 interpolant, 6 Delta panels per decade
   LOGICAL::cache_warned=.FALSE.
   REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0,twopi=2d0*pi
   REAL(KIND(1d0)),PARAMETER::mp=mproton,mp2=mp**2
@@ -87,10 +88,12 @@ MODULE InelasticFlux
   ! Clenshaw-Curtis for panels with b~ (width) <= lev_theta, Levin beyond
   INTEGER,PARAMETER::NLV=8
   REAL(KIND(1d0)),PARAMETER::lev_theta=3d0
-  ! fast rows with rho (rho_row): Delta panels rho_dens per decade from rho_dlo kappa to Dmax, interpolant in Delta^2
-  ! below rho_d2frac kappa; inner psi integral: one Gauss-Legendre 4 panel when Delta < rho_inner_short k1, else
-  ! rho_inner_npan Gauss-Legendre 8 panels (each setting <= 1e-8 of the peak against tighter ones)
-  REAL(KIND(1d0)),PARAMETER::rho_dens=3d0,rho_dlo=1d-4,rho_d2frac=0.1d0,rho_inner_short=0.3d0
+  ! fast rows with rho (rho_row): Delta panels rho_dens per decade from rho_dlo kappa to Dmax, the overlaps exact on
+  ! every panel (M15: no interpolant in Delta^2; 6 panels per decade, 3 left gaussian and regge_shrink 3e-5 of the
+  ! peak from refined rows, 6 give <= 4e-7); inner psi integral: one Gauss-Legendre 4 panel when
+  ! Delta < rho_inner_short k1, else rho_inner_npan Gauss-Legendre 8 panels (each setting <= 1e-8 of the peak against
+  ! tighter ones)
+  REAL(KIND(1d0)),PARAMETER::rho_dens=6d0,rho_dlo=1d-4,rho_inner_short=0.3d0
   INTEGER,PARAMETER::rho_inner_npan=2
   ! inner psi integrals of rho_phat_mu (inner_phi_cc): NCL (one panel when Delta < rho_inner_short k1: NCS)
   ! Chebyshev-Lobatto points per panel, values -> Chebyshev coefficients (cml, cms), integrals of T_k on [-1,1] (wtl, wts)
@@ -1872,8 +1875,9 @@ CONTAINS
     ! x f/alpha with rho (rho_model) at all b and mu2 of one x, per mx node with s = W_step(mx): resonances (s = 0)
     ! products of the amplitudes (amps_mu); continuum (s = 1) the rho pairs (1/2 pi) int Delta dDelta J0(b~ Delta)
     ! exp(-B Delta^2) P^(Delta) (rho_phat_mu; Levin/Clenshaw-Curtis on Delta panels rho_dens per decade from rho_dlo
-    ! kappa to Dmax = sqrt(16 ln 10/B), kappa = A; narrow nodes, kappa > Dmax: P^ on NLV Chebyshev points in Delta^2
-    ! over [0, Dmax^2] interpolated; wide nodes: below rho_d2frac kappa likewise over [0, (rho_d2frac kappa)^2]); inside
+    ! kappa to Dmax = sqrt(16 ln 10/B), kappa = A; P^ exact on every panel: (M15) the former interpolant of P^ in
+    ! Delta^2 on [0, Dmax^2] (narrow nodes) or [0, (rho_d2frac kappa)^2] was off by up to 5e-5 of the peak with a
+    ! finite mu cut, now <= 6e-7 against refined rows (drivers/rep_inel; a row costs 3.3 times more)); inside
     ! the W^2 step the source rule s^2 [pair] + s (1-s) [rho(k) F] G + (1-s) s F [rho(k) G] + (1-s)^2 F G. No A b cut
     ! (as the Python with rho). Per node only the mu2 it contributes to (A^2 <= A2_mu mu2) are computed
     IMPLICIT NONE
@@ -1884,7 +1888,7 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(nb,nmu),INTENT(OUT)::Nrow
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::e,e2,De
     REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::G,G2
-    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Ph,Gpm,Phn
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Ph,Gpm
     REAL(KIND(1d0)),DIMENSION(nmu)::kcv
     INTEGER,DIMENSION(nmu)::ima
     INTEGER::nma,ma
@@ -1892,7 +1896,7 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(6,6)::Pm
     REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::Ivm
     INTEGER,DIMENSION(14)::pp,qq
-    REAL(KIND(1d0))::A,hi0,sw,Bs,kap,Dmax,D1,c0,h,Dn(NLV),pre,bt,tq,Dlo
+    REAL(KIND(1d0))::A,hi0,sw,Bs,kap,Dmax,c0,h,Dn(NLV),pre,bt,Dlo
     INTEGER::i,j,m,k,np,np2,ndp,npr,p,q,jj
     npr=0
     DO p=1,6
@@ -1924,38 +1928,11 @@ CONTAINS
           DO k=0,ndp-1
              De(k+2)=Dlo*(Dmax/Dlo)**(DBLE(k)/(ndp-1))
           ENDDO
-          D1=0d0
-          IF(kap.LE.Dmax)D1=rho_d2frac*kap
-          IF(D1.GT.0d0.AND.D1.LT.Dmax)THEN ! D1 as a panel edge
-             De(ndp+2)=D1
-             k=ndp+2
-             CALL sort_unique(De,k,ndp)
-             ndp=ndp-1
-          ENDIF
-          ALLOCATE(Ph(6,6,NLV,nma),Gpm(NLV,npr,ndp,nma),Phn(6,6,NLV,nma),Ivm(npr,nma))
-          IF(kap.GT.Dmax)D1=Dmax ! narrow: all from the interpolant
-          IF(D1.GT.0d0)THEN
-             DO jj=1,NLV
-                Dn(jj)=DSQRT(0.5d0*D1**2*(1d0+tlv(jj)))
-             ENDDO
-             Dn(1)=0d0
-             CALL rho_phat_mu(nma,kcv(1:nma),hi0,NLV,Dn,e,np,G,Phn)
-          ENDIF
+          ALLOCATE(Ph(6,6,NLV,nma),Gpm(NLV,npr,ndp,nma),Ivm(npr,nma))
           DO k=1,ndp
              c0=0.5d0*(De(k)+De(k+1)); h=0.5d0*(De(k+1)-De(k))
              Dn=c0+h*tlv
              IF(Dn(1).LE.0d0)Dn(1)=0d0
-             IF(De(k+1).LE.D1*(1d0+1d-12))THEN ! panel inside [0,D1]: from the interpolant in Delta^2
-                DO jj=1,NLV
-                   tq=MIN(Dn(jj)**2/(0.5d0*D1**2)-1d0,1d0)
-                   DO m=1,nma
-                      DO q=1,npr
-                         Gpm(jj,q,k,m)=Dn(jj)*DEXP(-Bs*Dn(jj)**2)*bary(tq,Phn(pp(q),qq(q),:,m))/twopi
-                      ENDDO
-                   ENDDO
-                ENDDO
-                CYCLE
-             ENDIF
              CALL rho_phat_mu(nma,kcv(1:nma),hi0,NLV,Dn,e,np,G,Ph)
              DO m=1,nma
                 DO jj=1,NLV
@@ -1995,7 +1972,7 @@ CONTAINS
           ENDDO
        ENDDO
        IF(ALLOCATED(De))DEALLOCATE(De)
-       IF(ALLOCATED(Ph))DEALLOCATE(Ph,Gpm,Phn,Ivm)
+       IF(ALLOCATED(Ph))DEALLOCATE(Ph,Gpm,Ivm)
        IF(ALLOCATED(e2))DEALLOCATE(e2,G2)
        DEALLOCATE(e,G)
     ENDDO
@@ -2437,6 +2414,61 @@ CONTAINS
        R(iq)=proton_exact_comb_P(x,Ph(:,:,iq,1))/pi**2
     ENDDO
   END SUBROUTINE elastic_rhohat
+
+  SUBROUTINE nucleus_rhohat(x,RR,w,aa,nq,qv,R)
+    ! (M15) the two-dimensional Fourier transform of the elastic photon density of a nucleus with the Woods-Saxon
+    ! charge form factor F (unit charge, alpha = 1, as PhotonNumberDensity_ChargeFormFactor_WS) at q = qv (GeV): the
+    ! overlap P^(q) of its k_T integrand k^2 F(sqrt(k^2+A^2))/(k^2+A^2), A = x mN, divided by pi^2. RR, aa (the
+    ! Woods-Saxon radius and diffuseness) in GeV^-1. Panels: geometric 10/decade from 1e-3 min(A, 1/RR) to the cut
+    ! 1e3 GeV, and of width pi/(4 RR) (F oscillates with period ~2 pi/RR) from 1/RR to 8/aa (F < e^-25 beyond: the
+    ! integrand is 0 there). The overlaps by rho_phat_mu (about 2 ms per q): rho_phat_fast expands the inner integral
+    ! in q/k beyond k = 20 q, which assumes that f varies on the scale k (the proton); F varies on the scale 1/RR and
+    ! the expansion is off by up to 5e-6 at q ~ 1e-3 GeV (rho_phat_mu agrees with a direct two-dimensional quadrature
+    ! to 1e-10: drivers/m15_nuc_rho, scripts/m15_nuc_rho_ref.py)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x,RR,w,aa
+    INTEGER,INTENT(IN)::nq
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(IN)::qv
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(OUT)::R
+    REAL(KIND(1d0)),PARAMETER::mN=0.9315d0 ! as PhotonPhotonFlux_pA_WoodsSaxon_eval
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::t
+    REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::G
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Ph
+    REAL(KIND(1d0))::A,hi,klo,l0,l1,c0,h,k1,k2,kk
+    INTEGER::k,i,ngeo,nlin,ne,np
+    IF(.NOT.lv_init)CALL levin_setup()
+    R=0d0
+    IF(x.GE.1d0.OR.x.LE.0d0)RETURN
+    A=x*mN
+    hi=1d3
+    klo=1d-3*MIN(A,1d0/RR)
+    ngeo=INT(10*LOG10(hi/klo))+2
+    k1=1d0/RR; k2=MAX(8d0/aa,k1)
+    nlin=CEILING((k2-k1)/(pi/(4d0*RR)))
+    ALLOCATE(t(ngeo+nlin+2))
+    l0=LOG10(klo); l1=LOG10(hi)
+    DO k=0,ngeo-1
+       t(k+1)=10d0**(l0+k*((l1-l0)/(ngeo-1)))
+    ENDDO
+    ne=ngeo+1; t(ne)=0d0
+    DO k=0,nlin
+       ne=ne+1; t(ne)=k1+(k2-k1)*k/nlin
+    ENDDO
+    CALL sort_unique(t,ne,np)
+    np=np-1
+    ALLOCATE(G(NLV,6,np),Ph(6,6,nq,1))
+    G=0d0
+    DO k=1,np
+       IF(t(k).GE.k2)EXIT
+       c0=0.5d0*(t(k)+t(k+1)); h=0.5d0*(t(k+1)-t(k))
+       DO i=1,NLV
+          kk=c0+h*tlv(i)
+          G(i,1,k)=kk**2/(kk**2+A**2)*ChargeFormFactor_WoodsSaxon(DSQRT(kk**2+A**2),RR,w,aa,10)
+       ENDDO
+    ENDDO
+    CALL rho_phat_mu(1,(/hi/),hi,nq,qv,t(1:np+1),np,G,Ph)
+    R=Ph(1,1,:,1)/pi**2
+  END SUBROUTINE nucleus_rhohat
 
   SUBROUTINE cheb_setup(n,xc,wt,cm)
     ! n Chebyshev-Lobatto points xc(i) = cos(pi (i-1)/(n-1)) on [-1,1], the matrix cm of values -> coefficients of

@@ -4,7 +4,7 @@ MODULE PhotonPhotonFlux
   USE NINTLIB ! for multiple dimensional integrations
   USE interpolation
   USE InelasticFlux,ONLY:PhotonNumberDensity_inelastic_proton,PhotonFlux_proton_inelastic_nob,inel_fast_prepare_rows,&
-       inel_rhohat,elastic_rhohat,inel_rhohat_key
+       inel_rhohat,elastic_rhohat,inel_rhohat_key,nucleus_rhohat
   IMPLICIT NONE
   PRIVATE
   PUBLIC::alphaem_elasticphoton,alpha_running4photon,GENERATE_PROTON_FLUX_GRID
@@ -34,9 +34,10 @@ MODULE PhotonPhotonFlux
   ! (1-P)^ of P = (1-exp(-b^2/(2 b0)))^2 in closed form, N^ the two-dimensional Fourier transforms of the elastic
   ! (elastic_rhohat) and inelastic (inel_rhohat, at QS_NC1 Chebyshev nodes in ln q on [1e-6, QS_QM] and QS_NC2 in q on
   ! [QS_QM, 1.6] GeV, interpolated: exp(-B Delta^2) of rho /= delta) densities; q nodes:
-  ! Gauss-Legendre 6 on 2 panels per decade of q in [1e-6, 1.6] GeV. Otherwise the legacy b-space integration
+  ! Gauss-Legendre 6 on 2 panels per decade of q in [1e-6, 1.6] GeV. Otherwise the legacy b-space integration.
+  ! (M15) also pA with the Woods-Saxon profile (pA_qspace_*)
   LOGICAL,PUBLIC::pp_final_state_qspace=.TRUE.
-  ! (M11) the photon-photon grid of pp states 1-3: nodes computed when first needed (the same values)
+  ! (M11) the photon-photon grid of pp states 1-3: nodes computed when first needed (the same values); (M15) also pA
   LOGICAL,PUBLIC::pp_grid_lazy=.TRUE.
   INTEGER,PARAMETER,PRIVATE::QS_NQ=78,QS_NC1=12,QS_NC2=12,QS_NC=QS_NC1+QS_NC2,QS_MAXE=4096,QS_MAXI=16384
   REAL(KIND(1d0)),PARAMETER,PRIVATE::QS_LO=-13.815510557964274d0,QS_HI=0.47000362924573558d0 ! ln 1e-6, ln 1.6
@@ -50,6 +51,31 @@ MODULE PhotonPhotonFlux
   REAL(KIND(1d0)),DIMENSION(QS_NQ,QS_MAXE),PRIVATE,SAVE::qs_er
   REAL(KIND(1d0)),DIMENSION(QS_MAXI),PRIVATE,SAVE::qs_ix,qs_imu2
   REAL(KIND(1d0)),DIMENSION(QS_NC,QS_MAXI),PRIVATE,SAVE::qs_ir
+  ! (M15) pA (p+A, A+p: Woods-Saxon nucleus with ChFF, exact elastic proton) final states 1, 2 in momentum space, as pp:
+  ! L = (1/2 pi) int q dq (1-P_pA)^ rho_p^ rho_A^. q nodes: Gauss-Legendre QA_NG on panels of width 1.1 in ln q from
+  ! 1e-6 GeV to QA_Q1R/R_A, of width QA_DQR/R_A in q from there to 1.6 GeV ((1-P_pA)^ and the nucleus transforms
+  ! oscillate with period ~2 pi/R_A); weights q dq (1-P_pA)^/(2 pi). The inelastic transforms at their own Chebyshev
+  ! nodes (QA_NC1 in ln q on [1e-6, QS_QM], QA_NC2 in q on [QS_QM, 1.6] GeV: twice pp's, as (1-P_pA)^ weights q ~
+  ! 0.01-0.3 GeV more; with 12 + 12 the states are off by up to 9e-6 (dfjk), with 24 + 24 by <= 3.5e-6, the noise of
+  ! the fast transforms: drivers/m15_pA_test against exact transforms on 32 + 24 nodes), interpolated. Stores of the proton elastic and the nucleus transforms at the q nodes and at
+  ! q = 0 (node qa_nq+1, weight 0: the collinear fluxes, int d^2b N), and of the inelastic transforms per x, mu2
+  REAL(KIND(1d0)),PARAMETER,PRIVATE::QA_Q1R=0.5d0,QA_DQR=1d0
+  INTEGER,PARAMETER,PRIVATE::QA_NG=6,QA_NC1=24,QA_NC2=24,QA_NC=QA_NC1+QA_NC2
+  INTEGER,PARAMETER,PRIVATE::QA_MAXE=2048,QA_MAXN=2048,QA_MAXI=16384
+  INTEGER,PRIVATE,SAVE::qa_nq=0,qa_ne=0,qa_nn=0,qa_ekey=-1,qa_ni=0,qa_ikey=-1
+  REAL(KIND(1d0)),DIMENSION(QA_NC),PRIVATE,SAVE::qa_qc
+  REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::qa_ix,qa_imu2
+  REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE,PRIVATE,SAVE::qa_ir
+  REAL(KIND(1d0)),DIMENSION(6),PRIVATE,SAVE::qa_key=-1d0 ! R_A, w, a (fm), A, sigma_NN (fm^2), use_MC_Glauber
+  REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::qa_q,qa_w,qa_ex,qa_nx
+  REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE,PRIVATE,SAVE::qa_ci,qa_er,qa_nr
+  ! (M15) the exact collinear flux of the nucleus: ln rho_A^(q=0; x) on QA_CPD nodes per decade of x in
+  ! [QA_CXLO, QA_CXHI], 8-point Lagrange in ln x (direct outside)
+  INTEGER,PARAMETER,PRIVATE::QA_CPD=40
+  REAL(KIND(1d0)),PARAMETER,PRIVATE::QA_CXLO=1d-10,QA_CXHI=0.5d0
+  INTEGER,PRIVATE,SAVE::qa_cn=0
+  REAL(KIND(1d0)),PRIVATE,SAVE::qa_ch=0d0
+  REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE,PRIVATE,SAVE::qa_ct
   PUBLIC::PhotonFlux_proton_EDFF_nob,PhotonFlux_proton_ChFF_nob,PhotonFlux_proton_ChFF_exact_nob
   PUBLIC::PhotonPhotonFlux_pA_hardsphere,PhotonPhotonFlux_pA_hardsphere_eval
   PUBLIC::PhotonPhotonFlux_pA_WoodsSaxon,PhotonPhotonFlux_pA_WoodsSaxon_eval
@@ -1920,6 +1946,8 @@ CONTAINS
     LOGICAL::force_pnohad1
     INTEGER::gstate=0,gsel
     SAVE gstate
+    REAL(KIND(1d0)),PARAMETER::ZUNSET=-HUGE(1d0) ! (M15) a node of the grid not computed yet
+    LOGICAL::lazy
     IF(.NOT.print_banner)THEN
        WRITE(*,*)"==============================================================="
        WRITE(*,*)"|                                                             |"
@@ -2019,14 +2047,10 @@ CONTAINS
        ENDIF
        XD_1D(MX+1)=DBLE(log10xmin)
        YD_1D(MY+1)=DBLE(log10xmin)
-       IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
-          ! the inelastic densities of the proton at all nodes and scales of the grid, one row per x
-          IF(nuclearA_beam1.NE.0)THEN
-             CALL pp_inelastic_prepare(MY+1,10d0**YD_1D,MX+1,10d0**XD_1D,.TRUE.)
-          ELSE
-             CALL pp_inelastic_prepare(MX+1,10d0**XD_1D,MY+1,10d0**YD_1D,.TRUE.)
-          ENDIF
-       ENDIF
+       ! (M15) states 1-3 (pp_grid_lazy): the nodes are computed when a lookup first needs them (fill_block), as pp
+       lazy=pp_grid_lazy.AND.photon_final_state.NE.0
+       IF(.NOT.lazy.AND.(photon_final_state.EQ.1.OR.photon_final_state.EQ.2))CALL prepare_block(MX+1,10d0**XD_1D,&
+            MY+1,10d0**YD_1D,0d0)
        DO I=1,MX+1
           xx1=10d0**(XD_1D(I))
           DO J=1,MY+1
@@ -2035,6 +2059,10 @@ CONTAINS
                 CYCLE
              ENDIF
              xx2=10d0**(YD_1D(J))
+             IF(lazy)THEN
+                ZD(I,J)=ZUNSET
+                CYCLE
+             ENDIF
              ZD(I,J)=PhotonPhotonFlux_pA_WoodsSaxon_eval(xx1,xx2)
              IF(MX_save.EQ.0.AND.MY_save.EQ.0)THEN
                 IF(I.EQ.2.AND.J.EQ.2)THEN
@@ -2116,6 +2144,7 @@ CONTAINS
              WRITE(*,*)"Error: you cannot reach here #2 !"
              STOP 1
           ENDIF
+          IF(pp_grid_lazy.AND.photon_final_state.NE.0)CALL fill_block(K,L)
           DO I=1,n_interp
              XD2_1D(I)=XD_1D(K+I)
              YD2_1D(I)=YD_1D(L+I)
@@ -2163,6 +2192,50 @@ CONTAINS
        ENDIF
     ENDIF
     RETURN
+  CONTAINS
+    SUBROUTINE fill_block(K0,L0)
+      ! (M15) as PhotonPhotonFlux_pp: the nodes of the stencil K0+1..K0+n_interp, L0+1..L0+n_interp not computed yet,
+      ! the transforms (or the b-space rows) of their x and scales first
+      INTEGER,INTENT(IN)::K0,L0
+      REAL(KIND(1d0)),DIMENSION(n_interp)::xa,xb
+      INTEGER::ii,jj
+      IF(ALL(ZD(K0+1:K0+n_interp,L0+1:L0+n_interp).NE.ZUNSET))RETURN
+      xa=10d0**XD_1D(K0+1:K0+n_interp)
+      xb=10d0**YD_1D(L0+1:L0+n_interp)
+      IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)CALL prepare_block(n_interp,xa,n_interp,xb,&
+           photon_mu2(xa(n_interp),xb(n_interp))*(1d0-1d-12))
+      DO jj=1,n_interp
+         DO ii=1,n_interp
+            IF(ZD(K0+ii,L0+jj).NE.ZUNSET)CYCLE
+            ZD(K0+ii,L0+jj)=PhotonPhotonFlux_pA_WoodsSaxon_eval(xa(ii),xb(jj))
+            ZD_save(K0+ii,L0+jj)=ZD(K0+ii,L0+jj)
+         ENDDO
+      ENDDO
+    END SUBROUTINE fill_block
+    SUBROUTINE prepare_block(na,xa,nb,xb,mu2lo)
+      ! the transforms (momentum space) or the b-space rows of the proton (legacy) for the beam-1 x of xa and the
+      ! beam-2 x of xb: momentum space at the scales >= mu2lo of the grid rows and columns through them, legacy at
+      ! the scales of the pairs xa x xb
+      INTEGER,INTENT(IN)::na,nb
+      REAL(KIND(1d0)),DIMENSION(na),INTENT(IN)::xa
+      REAL(KIND(1d0)),DIMENSION(nb),INTENT(IN)::xb
+      REAL(KIND(1d0)),INTENT(IN)::mu2lo
+      REAL(KIND(1d0))::d
+      IF(qspace_ok())THEN
+         ! the nucleus of _eval, set at its first call with 0 < x < 1 (a stencil may start at x = 1)
+         d=PhotonPhotonFlux_pA_WoodsSaxon_eval(1d-3,1d-3,.TRUE.)
+         CALL pA_qspace_setup_common()
+         IF(nuclearA_beam1.NE.0)THEN
+            CALL pA_qspace_prepare_grid(nb,xb,MX+1,10d0**XD_1D,na,xa,mu2lo)
+         ELSE
+            CALL pA_qspace_prepare_grid(na,xa,MY+1,10d0**YD_1D,nb,xb,mu2lo)
+         ENDIF
+      ELSEIF(nuclearA_beam1.NE.0)THEN
+         CALL pp_inelastic_prepare(nb,xb,na,xa,.TRUE.)
+      ELSE
+         CALL pp_inelastic_prepare(na,xa,nb,xb,.TRUE.)
+      ENDIF
+    END SUBROUTINE prepare_block
   END FUNCTION PhotonPhotonFlux_pA_WoodsSaxon
 
   FUNCTION PhotonPhotonFlux_pA_WoodsSaxon_eval(x1,x2,FORCEPNOHAD1)
@@ -2316,7 +2389,12 @@ CONTAINS
     CALL set_photon_scale(x1,x2)
     IF(force_pnohad1.OR.photon_final_state.EQ.3)THEN
        ! we only use PNOHAD=1
-       IF(USE_CHARGEFORMFACTOR4PHOTON)THEN
+       IF(photon_final_state.NE.0.AND.qspace_ok())THEN
+          ! (M15) the final states with the momentum-space path: the exact collinear flux of the nucleus
+          elp=PhotonFlux_proton_nob(x1_common,gamma1_common)
+          CALL pA_qspace_setup(RA_common,wVal_common,aaVal_common,A_common,sigNN_inel_common)
+          elA=Z2**2*alpha/x2_common*pA_nucleus_coll(x2_common)
+       ELSEIF(USE_CHARGEFORMFACTOR4PHOTON)THEN
           elp=PhotonFlux_proton_nob(x1_common,gamma1_common)
           elA=PhotonFlux_nucleus_ChFF_nob(2,x2_common,gamma2_common,Z2,RA_common,wVal_common,aaVal_common)
        ELSE
@@ -2326,6 +2404,20 @@ CONTAINS
        ! (only the proton, beam 1 here, has an inelastic photon)
        PhotonPhotonFlux_pA_WoodsSaxon_eval=final_state_nob(elp*ael_photon,elA*ael_photon,x1_common,x2_common,1)
        PhotonPhotonFlux_pA_WoodsSaxon_eval=MAX(PhotonPhotonFlux_pA_WoodsSaxon_eval,0d0)
+       RETURN
+    ENDIF
+    IF((photon_final_state.EQ.1.OR.photon_final_state.EQ.2).AND.qspace_ok())THEN
+       ! (M15) momentum space, as pp (the proton is beam 1 here): 1: inel-el P = inel-el - inel-el (1-P), 2: (1-P)
+       ! (el-el + inel-el)
+       CALL pA_qspace_setup(RA_common,wVal_common,aaVal_common,A_common,sigNN_inel_common)
+       CALL pA_qspace_L(x1_common,x2_common,elp,elA) ! elp = L(el_p,el_A), elA = L(in_p,el_A) (unit charges, alpha(0))
+       IF(photon_final_state.EQ.1)THEN
+          integral=-alpha**2*Z1**2*Z2**2/(x1*x2)*ael_photon*elA
+          elA=Z2**2*alpha/x2_common*pA_nucleus_coll(x2_common) ! the exact collinear flux, as state 3
+          PhotonPhotonFlux_pA_WoodsSaxon_eval=integral+final_state_nob(0d0,elA*ael_photon,x1_common,x2_common,1)
+       ELSE
+          PhotonPhotonFlux_pA_WoodsSaxon_eval=alpha**2*Z1**2*Z2**2/(x1*x2)*(ael_photon**2*elp+ael_photon*elA)
+       ENDIF
        RETURN
     ENDIF
     IF(photon_final_state.EQ.1.OR.photon_final_state.EQ.2)THEN
@@ -8968,7 +9060,7 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(6),PARAMETER::w6=(/0.171324492379170345040296142173d0,0.360761573048138607569833513838d0,&
          0.467913934572691047389870343990d0,0.467913934572691047389870343990d0,0.360761573048138607569833513838d0,&
          0.171324492379170345040296142173d0/)
-    REAL(KIND(1d0))::b0,s,h,t,u
+    REAL(KIND(1d0))::b0,s,h,t
     INTEGER::i,j,k,np
     s=4d0*e_pn(1)*e_pn(2)
     b0=9.81D0+0.211D0*DLOG(s)+0.0185D0*DLOG(s)**2 ! as PhotonPhotonFlux_pp_eval
@@ -8983,29 +9075,51 @@ CONTAINS
           qs_w(k)=0.5d0*h*w6(j)*qs_q(k)**2*(4d0*pi*b0*DEXP(-b0*qs_q(k)**2/2d0)-pi*b0*DEXP(-b0*qs_q(k)**2/4d0))/(2d0*pi)
        ENDDO
     ENDDO
-    DO i=1,QS_NC1
-       qs_qc(i)=DEXP(0.5d0*(QS_LO+DLOG(QS_QM))-0.5d0*(DLOG(QS_QM)-QS_LO)*DCOS(pi*(i-1)/(QS_NC1-1)))
-    ENDDO
-    DO i=1,QS_NC2
-       qs_qc(QS_NC1+i)=0.5d0*(QS_QM+DEXP(QS_HI))-0.5d0*(DEXP(QS_HI)-QS_QM)*DCOS(pi*(i-1)/(QS_NC2-1))
-    ENDDO
-    qs_ci=0d0
+    CALL qs_cheb_nodes(QS_NC1,QS_NC2,qs_qc)
     DO k=1,QS_NQ
-       IF(qs_q(k).LE.QS_QM)THEN
-          u=(2d0*DLOG(qs_q(k))-QS_LO-DLOG(QS_QM))/(DLOG(QS_QM)-QS_LO)
-          CALL cheb_row(QS_NC1,u,qs_ci(k,1:QS_NC1))
-       ELSE
-          u=(2d0*qs_q(k)-QS_QM-DEXP(QS_HI))/(DEXP(QS_HI)-QS_QM)
-          CALL cheb_row(QS_NC2,u,qs_ci(k,QS_NC1+1:QS_NC))
-       ENDIF
+       CALL qs_ci_row(qs_q(k),QS_NC1,QS_NC2,qs_ci(k,:))
     ENDDO
     ! new weights: the stored transforms stay valid (they do not depend on b0)
+  END SUBROUTINE qspace_setup
+
+  SUBROUTINE qs_cheb_nodes(n1,n2,qc)
+    ! (M11) the Chebyshev nodes of the inelastic transforms: n1 in ln q on [1e-6, QS_QM], n2 in q on [QS_QM, 1.6] GeV
+    IMPLICIT NONE
+    INTEGER,INTENT(IN)::n1,n2
+    REAL(KIND(1d0)),DIMENSION(n1+n2),INTENT(OUT)::qc
+    REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
+    INTEGER::i
+    DO i=1,n1
+       qc(i)=DEXP(0.5d0*(QS_LO+DLOG(QS_QM))-0.5d0*(DLOG(QS_QM)-QS_LO)*DCOS(pi*(i-1)/(n1-1)))
+    ENDDO
+    DO i=1,n2
+       qc(n1+i)=0.5d0*(QS_QM+DEXP(QS_HI))-0.5d0*(DEXP(QS_HI)-QS_QM)*DCOS(pi*(i-1)/(n2-1))
+    ENDDO
+  END SUBROUTINE qs_cheb_nodes
+
+  SUBROUTINE qs_ci_row(q,n1,n2,row)
+    ! (M11) the row at q of the interpolation of the inelastic transforms from their Chebyshev nodes (n1 in ln q on
+    ! [1e-6, QS_QM], n2 in q on [QS_QM, 1.6] GeV: qs_cheb_nodes)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::q
+    INTEGER,INTENT(IN)::n1,n2
+    REAL(KIND(1d0)),DIMENSION(n1+n2),INTENT(OUT)::row
+    REAL(KIND(1d0))::u
+    row=0d0
+    IF(q.LE.QS_QM)THEN
+       u=(2d0*DLOG(q)-QS_LO-DLOG(QS_QM))/(DLOG(QS_QM)-QS_LO)
+       CALL cheb_row(n1,u,row(1:n1))
+    ELSE
+       u=(2d0*q-QS_QM-DEXP(QS_HI))/(DEXP(QS_HI)-QS_QM)
+       CALL cheb_row(n2,u,row(n1+1:n1+n2))
+    ENDIF
   CONTAINS
     SUBROUTINE cheb_row(n,uu,w)
       ! barycentric weights of the n Chebyshev-Lobatto points -cos(pi (i-1)/(n-1)) at uu in [-1,1]
       INTEGER,INTENT(IN)::n
       REAL(KIND(1d0)),INTENT(IN)::uu
       REAL(KIND(1d0)),DIMENSION(n),INTENT(OUT)::w
+      REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
       INTEGER::ii
       REAL(KIND(1d0))::xi
       DO ii=1,n
@@ -9018,7 +9132,7 @@ CONTAINS
       ENDDO
       w=w/SUM(w)
     END SUBROUTINE cheb_row
-  END SUBROUTINE qspace_setup
+  END SUBROUTINE qs_ci_row
 
   SUBROUTINE qspace_keys()
     ! (M11) the stores are emptied when their settings change
@@ -9205,6 +9319,290 @@ CONTAINS
     Lee=SUM(qs_w*e1*e2)
     Lei=SUM(qs_w*(e1*i2+i1*e2))
   END SUBROUTINE pp_qspace_L
+
+  SUBROUTINE pA_qspace_setup(RA,wA,aA,A,sigNN)
+    ! (M15) the q nodes and weights of pA for the nucleus (Woods-Saxon R_A, w, a in fm, mass number A) and sigma_NN
+    ! (fm^2): (1-P_pA)^(q) = 2 pi int b db J0(q b) (1 - P_pA(b)), P_pA = exp(-sigma_NN A T^_A(b)) as
+    ! PNOHAD_pA_WoodsSaxon, with T^_A by Gauss-Legendre in z (normalised to 1) instead of its interpolation grid
+    ! (TA_MC_Glauber with use_MC_Glauber), on Gauss-Legendre 8 panels in b of width <= min(a/2, pi/(2 q_max)) up to
+    ! R_A + 40 a (1-P < 1e-16 beyond); the stores are emptied when the nucleus or sigma_NN change
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::RA,wA,aA,A,sigNN
+    REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
+    REAL(KIND(1d0)),DIMENSION(6)::key
+    REAL(KIND(1d0)),DIMENSION(1)::rc
+    REAL(KIND(1d0)),DIMENSION(QA_NG)::tg,wq
+    REAL(KIND(1d0)),DIMENSION(8)::xg,wg
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::bn,wb,omp
+    REAL(KIND(1d0))::R,q1,h1,h2,t,bmax,hb,zmax,hz,z,tn,chi,Pih
+    INTEGER::n1,n2,i,j,k,nb,nz,iz,g
+    key=(/RA,wA,aA,A,sigNN,MERGE(1d0,0d0,use_MC_Glauber)/)
+    IF(ALL(key.EQ.qa_key))RETURN
+    qa_key=key
+    R=RA/GeVm12fm
+    q1=QA_Q1R/R
+    n1=CEILING((DLOG(q1)-QS_LO)/1.1d0); h1=(DLOG(q1)-QS_LO)/n1
+    n2=CEILING((DEXP(QS_HI)-q1)/(QA_DQR/R)); h2=(DEXP(QS_HI)-q1)/n2
+    qa_nq=QA_NG*(n1+n2)
+    IF(ALLOCATED(qa_q))DEALLOCATE(qa_q,qa_w,qa_ci,qa_er,qa_nr,qa_ex,qa_nx)
+    ALLOCATE(qa_q(qa_nq+1),qa_w(qa_nq+1),qa_ci(qa_nq+1,QA_NC),qa_er(qa_nq+1,QA_MAXE),qa_nr(qa_nq+1,QA_MAXN),&
+         qa_ex(QA_MAXE),qa_nx(QA_MAXN))
+    IF(.NOT.ALLOCATED(qa_ir))THEN
+       ALLOCATE(qa_ix(QA_MAXI),qa_imu2(QA_MAXI),qa_ir(QA_NC,QA_MAXI))
+       CALL qs_cheb_nodes(QA_NC1,QA_NC2,qa_qc)
+    ENDIF
+    qa_q(qa_nq+1)=0d0; qa_w(qa_nq+1)=0d0; qa_ci(qa_nq+1,:)=0d0
+    CALL ffe_gauleg(QA_NG,tg,wq)
+    DO i=1,n1
+       DO j=1,QA_NG
+          k=QA_NG*(i-1)+j
+          t=QS_LO+(i-0.5d0)*h1+0.5d0*h1*tg(j)
+          qa_q(k)=DEXP(t); qa_w(k)=0.5d0*h1*wq(j)*qa_q(k)**2 ! q dq = q^2 dln q
+       ENDDO
+    ENDDO
+    DO i=1,n2
+       DO j=1,QA_NG
+          k=QA_NG*(n1+i-1)+j
+          qa_q(k)=q1+(i-0.5d0)*h2+0.5d0*h2*tg(j); qa_w(k)=0.5d0*h2*wq(j)*qa_q(k)
+       ENDDO
+    ENDDO
+    ! 1 - P_pA on the b nodes (GeV^-1)
+    CALL ffe_gauleg(8,xg,wg)
+    bmax=(RA+40d0*aA)/GeVm12fm
+    hb=MIN(0.5d0*aA/GeVm12fm,0.5d0*pi/DEXP(QS_HI))
+    nb=CEILING(bmax/hb); hb=bmax/nb
+    ALLOCATE(bn(8*nb),wb(8*nb),omp(8*nb))
+    DO i=1,nb
+       DO g=1,8
+          k=8*(i-1)+g
+          bn(k)=(i-0.5d0)*hb+0.5d0*hb*xg(g); wb(k)=0.5d0*hb*wg(g)
+       ENDDO
+    ENDDO
+    IF(use_MC_Glauber)THEN
+       DO k=1,8*nb
+          chi=TA_MC_Glauber(bn(k)*GeVm12fm,0d0,A)*sigNN ! as PNOHAD_pA_WoodsSaxon
+          omp(k)=MERGE(1d0,-expm1_(-chi),chi.GT.500d0)
+       ENDDO
+    ELSE
+       ! T_A(b) = int dz rho(sqrt(b^2+z^2)) (in units of the normalisation of rho_WoodsSaxon), Gauss-Legendre
+       ! 8 on panels of width a/2 in z; normalised to int d^2b T^_A = 1 on the b nodes
+       DO k=1,8*nb
+          zmax=DSQRT(MAX((RA+40d0*aA)**2-(bn(k)*GeVm12fm)**2,0d0))
+          nz=MAX(1,CEILING(zmax/(0.5d0*aA))); hz=zmax/nz
+          tn=0d0
+          DO iz=1,nz
+             DO g=1,8
+                z=(iz-0.5d0)*hz+0.5d0*hz*xg(g)
+                tn=tn+hz*wg(g)*rho_WoodsSaxon(DSQRT((bn(k)*GeVm12fm)**2+z**2),RA,wA,aA,A) ! both signs of z
+             ENDDO
+          ENDDO
+          omp(k)=tn
+       ENDDO
+       tn=2d0*pi*SUM(wb*bn*omp)*GeVm12fm**2 ! int d^2b T_A, b in fm
+       DO k=1,8*nb
+          chi=sigNN*A*omp(k)/tn
+          omp(k)=MERGE(1d0,-expm1_(-chi),chi.GT.500d0)
+       ENDDO
+    ENDIF
+    DO k=1,qa_nq
+       Pih=2d0*pi*SUM(wb*bn*BESSEL_J0(qa_q(k)*bn)*omp)
+       qa_w(k)=qa_w(k)*Pih/(2d0*pi)
+       CALL qs_ci_row(qa_q(k),QA_NC1,QA_NC2,qa_ci(k,:))
+    ENDDO
+    qa_ne=0; qa_nn=0
+    ! the collinear table of the nucleus (Parseval: one q = 0 transform per node)
+    qa_cn=NINT(QA_CPD*DLOG10(QA_CXHI/QA_CXLO))+1; qa_ch=DLOG(QA_CXHI/QA_CXLO)/(qa_cn-1)
+    IF(ALLOCATED(qa_ct))DEALLOCATE(qa_ct)
+    ALLOCATE(qa_ct(qa_cn))
+    DO i=1,qa_cn
+       CALL nucleus_rhohat(QA_CXLO*DEXP((i-1)*qa_ch),R,wA,aA/GeVm12fm,1,(/0d0/),rc)
+       qa_ct(i)=DLOG(rc(1))
+    ENDDO
+  CONTAINS
+    FUNCTION expm1_(y) ! exp(y)-1 without cancellation at small |y|
+      REAL(KIND(1d0))::expm1_
+      REAL(KIND(1d0)),INTENT(IN)::y
+      IF(ABS(y).LT.1d-5)THEN
+         expm1_=y*(1d0+y*(0.5d0+y/6d0))
+      ELSE
+         expm1_=DEXP(y)-1d0
+      ENDIF
+    END FUNCTION expm1_
+  END SUBROUTINE pA_qspace_setup
+
+  SUBROUTINE pA_qspace_setup_common()
+    ! (M15) pA_qspace_setup with the nucleus of PhotonPhotonFlux_pA_WoodsSaxon_eval (its COMMON, set at its first call)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::gamma1_common,gamma2_common,E1_common,E2_common,x1_common,x2_common,sigNN_inel_common,RA_common,&
+         A_common,aaVal_common,wVal_common
+    COMMON/PhotonPhoton_pA_WS/gamma1_common,gamma2_common,E1_common,E2_common,x1_common,x2_common,&
+         sigNN_inel_common,RA_common,A_common,aaVal_common,wVal_common
+    CALL pA_qspace_setup(RA_common,wVal_common,aaVal_common,A_common,sigNN_inel_common)
+  END SUBROUTINE pA_qspace_setup_common
+
+  SUBROUTINE pA_qspace_keys()
+    ! (M15) the stores of the proton transforms are emptied when their settings change
+    IMPLICIT NONE
+    include 'run90.inc'
+    INTEGER::k
+    k=proton_FF_correction+MERGE(10,0,alpha_running4photon)
+    IF(k.NE.qa_ekey)THEN
+       qa_ekey=k; qa_ne=0
+    ENDIF
+    k=inel_rhohat_key()
+    IF(k.NE.qa_ikey)THEN
+       qa_ikey=k; qa_ni=0
+    ENDIF
+  END SUBROUTINE pA_qspace_keys
+
+  INTEGER FUNCTION qa_in_find(x,mu2)
+    ! (M15) the store index of the inelastic transform of pA at x, mu2 (0: missing)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x,mu2
+    INTEGER::i
+    qa_in_find=0
+    DO i=qa_ni,1,-1
+       IF(qs_near(qa_ix(i),x).AND.qs_near(qa_imu2(i),mu2))THEN
+          qa_in_find=i; RETURN
+       ENDIF
+    ENDDO
+  END FUNCTION qa_in_find
+
+  SUBROUTINE qa_in_add(x,nmu,mu2v)
+    ! (M15) the inelastic transforms of pA (Chebyshev nodes qa_qc) at x and the scales mu2v not in the store
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::nmu
+    REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::mu2v
+    REAL(KIND(1d0)),DIMENSION(nmu)::mm
+    REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::R
+    INTEGER::i,j,n
+    LOGICAL::dup
+    n=0
+    DO i=1,nmu
+       IF(qa_in_find(x,mu2v(i)).GT.0)CYCLE
+       dup=.FALSE.
+       DO j=1,n
+          IF(qs_near(mm(j),mu2v(i)))dup=.TRUE.
+       ENDDO
+       IF(dup)CYCLE
+       n=n+1; mm(n)=mu2v(i)
+    ENDDO
+    IF(n.EQ.0)RETURN
+    ALLOCATE(R(QA_NC,n))
+    CALL inel_rhohat(x,QA_NC,qa_qc,n,mm(1:n),R)
+    IF(qa_ni+n.GT.QA_MAXI)qa_ni=0 ! full: start again
+    DO i=1,n
+       qa_ni=qa_ni+1
+       qa_ix(qa_ni)=x; qa_imu2(qa_ni)=mm(i); qa_ir(:,qa_ni)=R(:,i)
+    ENDDO
+    DEALLOCATE(R)
+  END SUBROUTINE qa_in_add
+
+  INTEGER FUNCTION qa_el(x)
+    ! (M15) the store index of the proton elastic transform at x on the pA nodes (computed if missing)
+    IMPLICIT NONE
+    include 'run90.inc'
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER::i
+    DO i=qa_ne,1,-1
+       IF(qs_near(qa_ex(i),x))THEN
+          qa_el=i; RETURN
+       ENDIF
+    ENDDO
+    IF(qa_ne.GE.QA_MAXE)qa_ne=0 ! full: start again
+    qa_ne=qa_ne+1
+    qa_ex(qa_ne)=x
+    CALL elastic_rhohat(x,proton_FF_correction,qa_nq+1,qa_q,qa_er(:,qa_ne))
+    qa_el=qa_ne
+  END FUNCTION qa_el
+
+  INTEGER FUNCTION qa_nuc(x)
+    ! (M15) the store index of the nucleus transform at x on the pA nodes (computed if missing)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER::i
+    DO i=qa_nn,1,-1
+       IF(qs_near(qa_nx(i),x))THEN
+          qa_nuc=i; RETURN
+       ENDIF
+    ENDDO
+    IF(qa_nn.GE.QA_MAXN)qa_nn=0 ! full: start again
+    qa_nn=qa_nn+1
+    qa_nx(qa_nn)=x
+    CALL nucleus_rhohat(x,qa_key(1)/GeVm12fm,qa_key(2),qa_key(3)/GeVm12fm,qa_nq+1,qa_q,qa_nr(:,qa_nn))
+    qa_nuc=qa_nn
+  END FUNCTION qa_nuc
+
+  SUBROUTINE pA_qspace_L(xp,xA,Lee,Lie)
+    ! (M15) at the scale mu2_photon, the proton at xp, the nucleus at xA: Lee = (1/2 pi) int q dq (1-P_pA)^ el_p^
+    ! el_A^, Lie = the same with in_p^ (elastic photons at alpha(0) and unit charge, inelastic as InelasticFlux);
+    ! after pA_qspace_setup
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::xp,xA
+    REAL(KIND(1d0)),INTENT(OUT)::Lee,Lie
+    REAL(KIND(1d0)),DIMENSION(qa_nq)::eA
+    INTEGER::k
+    CALL pA_qspace_keys()
+    eA=qa_w(1:qa_nq)*qa_nr(1:qa_nq,qa_nuc(xA))
+    Lee=SUM(eA*qa_er(1:qa_nq,qa_el(xp)))
+    k=qa_in_find(xp,mu2_photon)
+    IF(k.EQ.0)THEN
+       CALL qa_in_add(xp,1,(/mu2_photon/)); k=qa_in_find(xp,mu2_photon)
+    ENDIF
+    Lie=SUM(eA*MATMUL(qa_ci(1:qa_nq,:),qa_ir(:,k)))
+  END SUBROUTINE pA_qspace_L
+
+  FUNCTION pA_nucleus_coll(xA)
+    ! (M15) int d^2b N_A(b) of the nucleus at xA (unit charge, alpha = 1): its transform at q = 0, from the table of
+    ! pA_qspace_setup; Z^2 alpha/xA times this is the collinear flux of PhotonFlux_nucleus_ChFF_nob, whose table is off
+    ! by up to 6e-3 at xA < 1e-4 (drivers/m15_nuc_coll); after pA_qspace_setup
+    IMPLICIT NONE
+    REAL(KIND(1d0))::pA_nucleus_coll
+    REAL(KIND(1d0)),INTENT(IN)::xA
+    REAL(KIND(1d0)),DIMENSION(8)::wt
+    REAL(KIND(1d0)),DIMENSION(1)::r
+    INTEGER::i0
+    IF(xA.GE.QA_CXLO.AND.xA.LE.QA_CXHI)THEN
+       ! the table (the transforms at all q of a new x cost 0.75 s; the luminosity integral asks for many x)
+       CALL ffe_lagu(DLOG(xA/QA_CXLO)/qa_ch,qa_cn,8,i0,wt)
+       pA_nucleus_coll=DEXP(SUM(wt*qa_ct(i0+1:i0+8)))
+    ELSE
+       CALL nucleus_rhohat(xA,qa_key(1)/GeVm12fm,qa_key(2),qa_key(3)/GeVm12fm,1,(/0d0/),r)
+       pA_nucleus_coll=r(1)
+    ENDIF
+  END FUNCTION pA_nucleus_coll
+
+  SUBROUTINE pA_qspace_prepare_grid(np,xps,my,ys,nA,xAs,mu2lo)
+    ! (M15) for each proton x of xps the inelastic transforms at the scales with every nucleus x of ys (its grid row)
+    ! at scales mu2 >= mu2lo, and its elastic transform; the transforms of the nucleus at xAs; after pA_qspace_setup
+    IMPLICIT NONE
+    INTEGER,INTENT(IN)::np,my,nA
+    REAL(KIND(1d0)),DIMENSION(np),INTENT(IN)::xps
+    REAL(KIND(1d0)),DIMENSION(my),INTENT(IN)::ys
+    REAL(KIND(1d0)),DIMENSION(nA),INTENT(IN)::xAs
+    REAL(KIND(1d0)),INTENT(IN)::mu2lo
+    REAL(KIND(1d0)),DIMENSION(my)::mu2v
+    REAL(KIND(1d0))::m2x
+    INTEGER::i,j,k
+    CALL pA_qspace_keys()
+    DO i=1,np
+       IF(xps(i).LE.0d0.OR.xps(i).GE.1d0)CYCLE
+       k=0
+       DO j=1,my
+          IF(ys(j).LE.0d0.OR.ys(j).GE.1d0)CYCLE
+          m2x=photon_mu2(xps(i),ys(j))
+          IF(m2x.LT.mu2lo)CYCLE
+          k=k+1; mu2v(k)=m2x
+       ENDDO
+       IF(k.GT.0)CALL qa_in_add(xps(i),k,mu2v(1:k))
+       k=qa_el(xps(i))
+    ENDDO
+    DO i=1,nA
+       IF(xAs(i).LE.0d0.OR.xAs(i).GE.1d0)CYCLE
+       k=qa_nuc(xAs(i))
+    ENDDO
+  END SUBROUTINE pA_qspace_prepare_grid
 
   SUBROUTINE pp_inelastic_prepare(n1,x1s,n2,x2s,ONLYBEAM1)
     ! ONLYBEAM1 (pA, the proton as beam 1): only the rows of beam 1
