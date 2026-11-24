@@ -1,6 +1,6 @@
 PROGRAM test
   USE OpticalGlauber_Geometry
-  USE ElasticPhotonPhotonFlux
+  USE PhotonPhotonFlux
   IMPLICIT NONE
   include 'run90.inc'
   INTEGER::I

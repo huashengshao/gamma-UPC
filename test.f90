@@ -1,6 +1,6 @@
 PROGRAM test
   USE OpticalGlauber_Geometry
-  USE ElasticPhotonPhotonFlux
+  USE PhotonPhotonFlux
   IMPLICIT NONE
   include 'run90.inc'
   INTEGER::I
@@ -30,35 +30,30 @@ PROGRAM test
   nuclearA_beam2=208
   nuclearZ_beam1=82
   nuclearZ_beam2=82
-  !x1=0.00099601593625498d0
-  !x2=x1
+  x1=0.00099601593625498d0
+  x2=x1
   !flux1=PhotonPhotonFlux_AB_WoodsSaxon_eval(x1,x2)
   !flux1=Lgammagamma_UPC(5d0,3,1)
   !PRINT *, "default:",flux1
   !RETURN
-  !neutron_tagging(1)=-1
-  !neutron_tagging(2)=-1
+  neutron_tagging(1)=-1
+  neutron_tagging(2)=-1
   !flux1=PhotonPhotonFlux_AB_WoodsSaxon_eval(x1,x2)
   !flux1=Lgammagamma_UPC(5d0,3,1)
   !PRINT *, "XnXn:",flux1
   !RETURN
-  !neutron_tagging(1)=0
-  !neutron_tagging(2)=0
+  neutron_tagging(1)=0
+  neutron_tagging(2)=0
   !flux1=PhotonPhotonFlux_AB_WoodsSaxon_eval(x1,x2)
   !flux1=Lgammagamma_UPC(5d0,3,1) 
   !PRINT *, "0n0n:",flux1
   !RETURN
-  neutron_tagging(1)=4
-  neutron_tagging(2)=4
-  !neutron_conj_sum=.TRUE.
+  neutron_tagging(1)=-1
+  neutron_tagging(2)=0
+  neutron_conj_sum=.TRUE.
   !flux1=PhotonPhotonFlux_AB_WoodsSaxon_eval(x1,x2)
-  OPEN(UNIT=2033,FILE="/Users/hua-shengshao/Physics/gammaUPC/ExcitingIons/gammaUPC/Lgammagamma_4n4n_PbPb_LM_ChFF.dat")
-  DO I=0,100
-     mass1=1.05d0**I
-     flux1=Lgammagamma_UPC(mass1,3,1)
-     WRITE(2033,*)mass1,flux1
-  ENDDO
-  CLOSE(UNIT=2033)
+  flux1=Lgammagamma_UPC(5d0,3,1)
+  PRINT *, "0nXn+Xn0n:",flux1
   RETURN
 !  gamma1=5020d0/2d0/mN
 !  !gamma1=6500d0/mproton

@@ -13,8 +13,9 @@ MODULE InelasticFlux
   ! functions; Python rho_region = 'continuum'), with the source rule across the step.
   ! Normalisation as the elastic densities of ElasticFlux: x f/alpha, b in GeV^-1; the scale mu2 (GeV^2) cuts
   ! kT^2 + x^2 mp^2 < mu2 (required; HUGE(1d0): no cut).
-  USE ElasticFlux,ONLY:mproton,alphaem_elasticphoton,aqedup,alpha_running4photon,GENERATE_PROTON_FLUX_GRID
-  USE alpha_running,ONLY:alpha_ratio_ph
+  USE ElasticFlux,ONLY:proton_exact_kspace,proton_exact_edges,proton_exact_comb_P,&
+       mproton,alphaem_elasticphoton,aqedup,alpha_running4photon,GENERATE_PROTON_FLUX_GRID
+  USE alpha_running,ONLY:alpha_ratio_tab
   USE structure_functions,ONLY:F2_FL_h,mpi,W2lo,W2hi,Q2_pdf,Q2_pdf_ramp,rho_W2,low_Q2_model,sf_check,sf_version,&
        sf_pdf_id,sf_xc,sf_Q2c
   USE bessel_integration,ONLY:bessel_integrate_finite,sort_unique
@@ -33,6 +34,13 @@ MODULE InelasticFlux
   ! panels: 3e-6 from it). rho_model /= 0 (rho_row): the rho pairs from momentum-space overlaps. Rows filled on demand
   ! or, all at once, by inel_fast_prepare(_rows) (serial; in parallel only if built with the optional make OPENMP=1).
   PUBLIC::inel_fast_prepare,inel_fast_prepare_rows
+  ! two-dimensional Fourier transforms of the b-space densities (momentum space, the (1-P) parts of the final states of
+  ! PhotonPhotonFlux)
+  PUBLIC::inel_rhohat,elastic_rhohat,inel_rhohat_key
+  LOGICAL,PARAMETER::rhohat_fast=.TRUE. ! rho_phat_fast in inel_rhohat (.FALSE.: rho_phat_mu, the reference)
+  REAL(KIND(1d0)),PARAMETER::rhohat_kb2=30d0 ! (M12) bands of cuts rhohat_kb2 D <= kc < rhohat_kb D to O(D^2) (<= 1e-6)
+  REAL(KIND(1d0)),PARAMETER::rhohat_kb=300d0 ! bands of cuts kc >= rhohat_kb D at leading order (<= 1.4e-6)
+  REAL(KIND(1d0)),PARAMETER::rhohat_kf=3d0 ! cuts kc < rhohat_kf D by rho_phat_mu (coarse outer panels)
   ! disk cache of the rows (fast_row_compute): directory (default '.', the working directory; '' disables). One file
   ! per computed block of a row, named by a hash of the settings (rho_model, low_Q2_model, alpha_running4photon,
   ! sf_pdf_id and its continuation thresholds, CACHE_VERSION), x and the b and mu2 lists; read back only if all of
@@ -65,7 +73,7 @@ MODULE InelasticFlux
        0.313706645877887287337962201987d0,0.362683783378361982965150449277d0,0.362683783378361982965150449277d0,&
        0.313706645877887287337962201987d0,0.222381034453374470544355994426d0,0.101228536290376259152531354310d0/)
   ! the six k_T integrals (I_rows of the Python): (form, nk, nj) = (F1,2,J1),(F1,1,J0),(F2,3,J0),(F2,3,J2),(F2,2,J1),(F2,1,J0)
-  INTEGER,DIMENSION(6),PARAMETER::row_form=(/1,1,2,2,2,2/),row_nk=(/2,1,3,3,2,1/),row_nj=(/1,0,0,2,1,0/)
+  INTEGER,DIMENSION(6),PARAMETER::row_nj=(/1,0,0,2,1,0/) ! (form and power of k_T: rows_at)
   ! tables: ln Q2 nodes, mx nodes and weights of int dmx^2/(2 pi), GE_h, GM_h and their PCHIP slopes per node
   LOGICAL::init=.FALSE.
   INTEGER::NMX,tab_model=-1 ! low_Q2_model of the tables (rebuilt when it changes, as set_low_Q2_model of the Python)
@@ -111,19 +119,26 @@ MODULE InelasticFlux
   ! state of the integrands (x, mx, the k_T weights)
   REAL(KIND(1d0))::xc=0d0,mxc=-1d0,sregc=1d0
   INTEGER::itab=0 ! table of mxc: > 0 node, < 0 extra
-  !$OMP THREADPRIVATE(xc,mxc,sregc,itab)
-  ! grid of the collinear flux (with GENERATE_PROTON_FLUX_GRID of ElasticFlux): ln(x f/alpha) of coll_row on
-  ! v = ln(x/(1-x)) (CVH: 80 per decade at small x), CXMIN <= x <= CXMAX (with a mu limit above CXHI1), and
+  INTEGER::lqhint=0 ! ln Q2 interval of the last GE_GM_core
+  !$OMP THREADPRIVATE(xc,mxc,sregc,itab,lqhint)
+  ! grid of the collinear flux (with GENERATE_PROTON_FLUX_GRID of ElasticFlux): ln(x f/alpha) of coll_row (cps) on
+  ! v = ln(x/(1-x)) (CVH: 80 per decade at small x), CXMIN <= x <= CXMAX, and
   ! t = ln(mu^2 - x^2 mp^2) (CTH: 20 per decade of k_c = sqrt(mu^2 - x^2 mp^2)), CKMIN <= k_c <= CKMAX; a v row (all
-  ! t) is computed when first needed
-  ! (coll_row: all mu at the cost of one); 6-point Lagrange in v and t; coll_row directly outside the grid or where
-  ! a value of the stencil is zero. Accuracy limited by the steps of the mx-node cut A^2 > A2_mu mu2 (~1e-5).
+  ! t) is computed when first needed (coll_row: all mu at the cost of one); 6-point Lagrange in v and t (with the
+  ! steps of the mx-node cut taken out, below); coll_row directly outside the grid or where a value of the stencil is
+  ! zero.
   REAL(KIND(1d0)),PARAMETER::CXMIN=1d-7,CXMAX=0.9999d0,CKMIN=1d0,CKMAX=1d5
-  ! x > CXHI1: the grid only for mu2 <= CMU2HI1 (900 GeV), and for x > CXHI2 mu2 <= CMU2HI2 (300 GeV) (coll_grid)
-  REAL(KIND(1d0)),PARAMETER::CXHI1=0.9d0,CXHI2=0.9995d0,CMU2HI1=900d0**2,CMU2HI2=300d0**2
+  ! The flux is a staircase in mu: each mx node is cut at A^2 > A2_mu mu2 (as the Python), a step that grows as
+  ! x -> 1 (up to 2% between the t nodes at x = 0.9, mu = 10 TeV). So each node of the grid keeps, besides the number
+  ! of active mx nodes (cnact), the flux with k = -KC..KC nodes fewer or more than active (cps, ln; partial sums in
+  ! node order, k = 0 the value itself), and the interpolation takes at every node of the stencil the value with the
+  ! active nodes of the point (nactive): no steps inside the stencil (grid/direct-1 <= 2e-6, 1e-6 <= x <= 0.9999,
+  ! 5 GeV <= mu <= 10 TeV). 12 MB, allocated at the first use.
+  INTEGER,PARAMETER::KC=8
+  INTEGER,DIMENSION(:,:),ALLOCATABLE::cnact
+  REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::cps
   REAL(KIND(1d0)),PARAMETER::CVH=2.30258509299404568d0/80d0,CTH=2d0*2.30258509299404568d0/20d0
   INTEGER,PARAMETER::NCV=886,NCT=102 ! v(NCV-2) >= ln(CXMAX/(1-CXMAX)), t(NCT) >= 2 ln(CKMAX)
-  REAL(KIND(1d0)),DIMENSION(NCT,NCV)::cgrid
   LOGICAL,DIMENSION(NCV)::cdone=.FALSE.
   INTEGER::ckey=-1
 CONTAINS
@@ -157,19 +172,16 @@ CONTAINS
   END FUNCTION PhotonFlux_proton_inelastic_nob
 
   FUNCTION coll_grid(x,mu2,F)
-    ! x f/alpha (collinear) from the grid (cgrid); .FALSE. when not available (grids off, outside, zero values)
+    ! x f/alpha (collinear) from the grid (cps); .FALSE. when not available (grids off, outside, zero values)
     IMPLICIT NONE
     LOGICAL::coll_grid
     REAL(KIND(1d0)),INTENT(IN)::x,mu2
     REAL(KIND(1d0)),INTENT(OUT)::F
     REAL(KIND(1d0)),PARAMETER::v0=-16.1180955509583157d0 ! ln(CXMIN/(1-CXMIN))
-    REAL(KIND(1d0))::kc2,v,t,wv(6),wt(6),mu2v(NCT),row(NCT),xi
-    INTEGER::i0,j0,i,j,key
+    REAL(KIND(1d0))::kc2,v,t,wv(6),wt(6),mu2v(NCT),row(NCT),xi,ps(-KC:KC,NCT),z(6,6)
+    INTEGER::i0,j0,i,j,key,na(NCT),ns,k
     coll_grid=.FALSE.; F=0d0
     IF(.NOT.GENERATE_PROTON_FLUX_GRID.OR.mu2.GE.HUGE(1d0).OR.x.LT.CXMIN.OR.x.GT.CXMAX)RETURN
-    ! above x = 0.9 the flux is a staircase in mu (the mx nodes cut at A^2 > A2_mu mu2 carry a growing share as
-    ! x -> 1): the mu interpolation keeps grid/direct-1 <= 2e-5 (as below 0.9) only up to these mu
-    IF(x.GT.CXHI1.AND.(mu2.GT.CMU2HI1.OR.(x.GT.CXHI2.AND.mu2.GT.CMU2HI2)))RETURN
     kc2=mu2-x**2*mp2
     IF(kc2.LT.CKMIN**2.OR.kc2.GT.CKMAX**2)RETURN
     CALL inel_init()
@@ -186,15 +198,26 @@ CONTAINS
        DO j=1,NCT
           mu2v(j)=DEXP(2d0*DLOG(CKMIN)+(j-1)*CTH)+xi**2*mp2
        ENDDO
-       CALL coll_row(xi,NCT,mu2v,row)
-       cgrid(:,i)=-HUGE(1d0)
-       WHERE(row.GT.0d0)cgrid(:,i)=DLOG(row)
+       IF(.NOT.ALLOCATED(cps))ALLOCATE(cnact(NCT,NCV),cps(-KC:KC,NCT,NCV))
+       CALL coll_row(xi,NCT,mu2v,row,na,ps)
+       cnact(:,i)=na
+       cps(:,:,i)=-HUGE(1d0)
+       WHERE(ps.GT.0d0)cps(:,:,i)=DLOG(ps)
        cdone(i)=.TRUE.
     ENDDO
-    IF(ANY(cgrid(j0:j0+5,i0:i0+5).EQ.-HUGE(1d0)))RETURN
+    ! the values at the nodes with the active mx nodes of the point (ns): no steps inside the stencil
+    ns=nactive(x,mu2)
+    DO i=1,6
+       DO j=1,6
+          k=ns-cnact(j0+j-1,i0+i-1)
+          IF(ABS(k).GT.KC)RETURN
+          z(j,i)=cps(k,j0+j-1,i0+i-1)
+       ENDDO
+    ENDDO
+    IF(ANY(z.EQ.-HUGE(1d0)))RETURN
     wv=lagrange6((v-v0)/CVH-(i0-1))
     wt=lagrange6((t-2d0*DLOG(CKMIN))/CTH-(j0-1))
-    F=DEXP(DOT_PRODUCT(wv,MATMUL(wt,cgrid(j0:j0+5,i0:i0+5))))
+    F=DEXP(DOT_PRODUCT(wv,MATMUL(wt,z)))
     coll_grid=.TRUE.
   CONTAINS
     FUNCTION lagrange6(p) ! weights of the 6 nodes 0..5 (unit spacing) at p
@@ -210,7 +233,23 @@ CONTAINS
     END FUNCTION lagrange6
   END FUNCTION coll_grid
 
-  SUBROUTINE coll_row(x,nmu,mu2v,F)
+  INTEGER FUNCTION nactive(x,mu2) ! number of mx nodes with A^2 <= A2_mu mu2 (the first ones: A^2 grows with mx)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x,mu2
+    INTEGER::lo,hi,mid
+    lo=0; hi=NMX
+    DO WHILE(hi.GT.lo)
+       mid=(lo+hi+1)/2
+       IF(DSQRT(A2(x,mx_nodes(mid)))**2.GT.A2_mu*mu2)THEN ! the test of coll_row (A**2, A = sqrt(A2))
+          hi=mid-1
+       ELSE
+          lo=mid
+       ENDIF
+    ENDDO
+    nactive=lo
+  END FUNCTION nactive
+
+  SUBROUTINE coll_row(x,nmu,mu2v,F,NACT,PS)
     ! collinear x f/alpha (int d^2b) at one x and all mu2v (GeV^2; HUGE(1d0): no cut): int dmx^2/(2 pi) on the mx
     ! nodes (mx nodes with A^2 > A2_mu mu2 dropped per mu, as mx_integral of the Python) of 2 pi int dkT/kT of the
     ! distribution with the integrals replaced by their integrands (xfxQ2_PDFinel_mx). Per mx node the k_T panels of
@@ -222,12 +261,18 @@ CONTAINS
     INTEGER,INTENT(IN)::nmu
     REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::mu2v
     REAL(KIND(1d0)),DIMENSION(nmu),INTENT(OUT)::F
+    ! optional (coll_grid): per mu the number of active mx nodes and the flux with k = -KC..KC nodes fewer or more
+    ! (partial sums in node order; k = 0: F; nodes beyond the last one computed: -1)
+    INTEGER,DIMENSION(nmu),INTENT(OUT),OPTIONAL::NACT
+    REAL(KIND(1d0)),DIMENSION(-KC:KC,nmu),INTENT(OUT),OPTIONAL::PS
+    REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::cnode
+    INTEGER::last,n
+    REAL(KIND(1d0))::cs
     REAL(KIND(1d0)),DIMENSION(nmu)::kmu,Im
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::e
     REAL(KIND(1d0)),DIMENSION(6)::v
-    REAL(KIND(1d0)),DIMENSION(6,6)::P
     REAL(KIND(1d0))::A,hi0,klo,l0,l1,c0,h,kk,Q2,Icum,pk
-    INTEGER::i,m,ngeo,ne,np,k,jj,q
+    INTEGER::i,m,ngeo,ne,np,k,jj
     CALL inel_init()
     IF(.NOT.lv_init)CALL levin_setup()
     DO m=1,nmu
@@ -235,9 +280,12 @@ CONTAINS
        IF(mu2v(m).LT.HUGE(1d0))kmu(m)=DSQRT(MAX(mu2v(m)-x**2*mp2,0d0))
     ENDDO
     F=0d0
+    ALLOCATE(cnode(NMX,MERGE(nmu,1,PRESENT(PS)))); cnode=0d0
+    last=0
     DO i=1,NMX
        A=DSQRT(A2(x,mx_nodes(i)))
        IF(ALL(mu2v.LT.HUGE(1d0).AND.A**2.GT.A2_mu*mu2v))CYCLE
+       last=i
        hi0=DSQRT(Q2_fac*((1d0-x)*mx_nodes(i)**2+A**2))
        CALL set_state(x,mx_nodes(i),1d0)
        klo=1d-3*MIN(A,hi0)
@@ -274,26 +322,54 @@ CONTAINS
              kk=c0+h*tlv(jj)
              IF(kk.LE.0d0)CYCLE ! the integrand vanishes at kT = 0
              CALL rows_at(kk,v)
-             DO q=1,6
-                P(:,q)=v*v(q)
-             ENDDO
-             pk=pk+h*wcc(jj)*combination(P,x,mx_nodes(i))/kk
+             pk=pk+h*wcc(jj)*combination_v(v,x,mx_nodes(i))/kk
           ENDDO
           Icum=Icum+pk
        ENDDO
        DO m=1,nmu
           IF(kmu(m).GE.hi0)Im(m)=Icum
+          IF(PRESENT(PS))cnode(i,m)=mx_weights(i)*Im(m) ! (only with PS: cnode has nmu columns then)
           IF(mu2v(m).LT.HUGE(1d0).AND.A**2.GT.A2_mu*mu2v(m))CYCLE
           F(m)=F(m)+mx_weights(i)*Im(m)
        ENDDO
        DEALLOCATE(e)
     ENDDO
+    IF(PRESENT(PS))THEN
+       DO m=1,nmu
+          n=nactive(x,mu2v(m))
+          NACT(m)=n
+          PS(:,m)=-1d0
+          cs=0d0
+          DO i=1,MIN(n+KC,last)
+             cs=cs+cnode(i,m)
+             IF(i.GE.n-KC)PS(i-n,m)=cs*twopi*alpha_norm(mu2v(m))/pi**2
+          ENDDO
+          DO k=-KC,MIN(-1,-n) ! fewer than no node
+             PS(k,m)=-1d0
+          ENDDO
+          IF(n.LE.KC.AND.n-KC.LE.0)PS(-n,m)=0d0
+       ENDDO
+    ENDIF
+    DEALLOCATE(cnode)
     DO m=1,nmu
        F(m)=F(m)*twopi*alpha_norm(mu2v(m))/pi**2
     ENDDO
   END SUBROUTINE coll_row
 
   ! ================================================================ distribution at fixed mx
+  FUNCTION combination_v(v,x,mx)
+    ! combination of the pairs P(i,j) = v(i)*v(j) (the same arithmetic, without the 6x6 products)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::combination_v
+    REAL(KIND(1d0)),DIMENSION(6),INTENT(IN)::v
+    REAL(KIND(1d0)),INTENT(IN)::x,mx
+    REAL(KIND(1d0))::c
+    c=mx-(1d0-x)*mp
+    combination_v=(1d0+(1d0-x)**2)/2d0*(v(1)*v(1))+((v(3)*v(3))+(v(4)*v(4)))/2d0/(mx+mp)**2&
+         +x*(c/(mx+mp)*((v(3)*v(6))+(v(2)*v(3))+x*(mx+mp)*c*(v(2)*v(6)))-((1d0-x)*mx-mp)/(mx+mp)*(v(1)*v(5)))&
+         +x**2/2d0*(c**2*((v(2)*v(2))+(v(6)*v(6)))+(mx**2+mp2)/(mx+mp)**2*(v(5)*v(5)))
+  END FUNCTION combination_v
+
   FUNCTION combination(P,x,mx)
     ! the quadratic form of the distribution in the pairs P(i,j) of the six integrals (b-space rows and collinear)
     IMPLICIT NONE
@@ -311,14 +387,13 @@ CONTAINS
     IMPLICIT NONE
     REAL(KIND(1d0)),INTENT(IN)::kT
     REAL(KIND(1d0)),DIMENSION(6),INTENT(OUT)::v
-    REAL(KIND(1d0))::D,Q2,F(2)
-    INTEGER::i
+    REAL(KIND(1d0))::D,Q2,F(2),k2,k3
     D=kT**2+A2(xc,mxc)
     Q2=D/(1d0-xc)
     CALL F1F2(mxc,Q2,F(1),F(2))
-    DO i=1,6
-       v(i)=kT**row_nk(i)/D*F(row_form(i))
-    ENDDO
+    ! v(i) = kT**row_nk(i)/D*F(row_form(i)), the powers as the integer power of the compiler (kT*(kT*kT) for 3)
+    k2=kT*kT; k3=kT*k2
+    v(1)=k2/D*F(1); v(2)=kT/D*F(1); v(3)=k3/D*F(2); v(4)=k3/D*F(2); v(5)=k2/D*F(2); v(6)=kT/D*F(2)
   END SUBROUTINE rows_at
 
   FUNCTION xfxQ2_PDFinel_mx(x,mx,mu2)
@@ -358,10 +433,10 @@ CONTAINS
     REAL(KIND(1d0)),INTENT(IN)::mx,Q2
     REAL(KIND(1d0)),INTENT(OUT)::F1,F2
     REAL(KIND(1d0))::GE,GM,tau,c
-    CALL GE_GM_h(mx,Q2,GE,GM)
+    CALL GE_GM_core(mx,Q2,GE,GM)
     tau=Q2/(mx+mp)**2
     c=DSQRT(twopi/(Q2+mx**2-mp2))/(1d0+tau)
-    IF(alpha_running4photon)c=c*alpha_ratio_ph(Q2)
+    IF(alpha_running4photon)c=c*alpha_ratio_tab(Q2) ! (M14) the table of alpha_running (= alpha_ratio_ph to 1.8e-11)
     F1=c*(GE+tau*GM)
     F2=c*(GM-GE)
   END SUBROUTINE F1F2
@@ -371,20 +446,36 @@ CONTAINS
     IMPLICIT NONE
     REAL(KIND(1d0)),INTENT(IN)::mx,Q2
     REAL(KIND(1d0)),INTENT(OUT)::GE,GM
+    CALL inel_init()
+    CALL GE_GM_core(mx,Q2,GE,GM)
+  END SUBROUTINE GE_GM_h
+
+  SUBROUTINE GE_GM_core(mx,Q2,GE,GM)
+    ! GE_GM_h after inel_init: the interval of the last call (lqhint) tried first, else the bisection (the same
+    ! interval as the bisection in both cases)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::mx,Q2
+    REAL(KIND(1d0)),INTENT(OUT)::GE,GM
     REAL(KIND(1d0))::v,t,h,m
     INTEGER::i,lo,hi,mid,k
-    CALL inel_init()
     IF(mx.NE.mxc.OR.itab.EQ.0)CALL find_table(mx)
     v=MIN(MAX(DLOG(Q2),lnQ2_min),lnQ2_max)
-    lo=1; hi=NLQ
-    DO WHILE(hi-lo.GT.1) ! lq(lo) <= v < lq(hi)
-       mid=(lo+hi)/2
-       IF(v.GE.lq(mid))THEN
-          lo=mid
-       ELSE
-          hi=mid
-       ENDIF
-    ENDDO
+    lo=0
+    IF(lqhint.GE.1.AND.lqhint.LT.NLQ)THEN ! lq(lo) <= v < lq(lo+1), as the bisection finds it
+       IF(v.GE.lq(lqhint).AND.v.LT.lq(lqhint+1))lo=lqhint
+    ENDIF
+    IF(lo.EQ.0)THEN
+       lo=1; hi=NLQ
+       DO WHILE(hi-lo.GT.1) ! lq(lo) <= v < lq(hi)
+          mid=(lo+hi)/2
+          IF(v.GE.lq(mid))THEN
+             lo=mid
+          ELSE
+             hi=mid
+          ENDIF
+       ENDDO
+       lqhint=lo
+    ENDIF
     i=MIN(lo,NLQ-1)
     t=v-lq(i); h=lq(i+1)-lq(i)
     DO k=1,2
@@ -399,7 +490,7 @@ CONTAINS
           GM=m
        ENDIF
     ENDDO
-  END SUBROUTINE GE_GM_h
+  END SUBROUTINE GE_GM_core
 
   SUBROUTINE hermite(y0,y1,d0,d1,h,t,y) ! cubic Hermite on [0,h] at t (scipy PPoly coefficients)
     IMPLICIT NONE
@@ -525,7 +616,7 @@ CONTAINS
     REAL(KIND(1d0))::alpha_norm
     REAL(KIND(1d0)),INTENT(IN)::mu2
     alpha_norm=1d0
-    IF(alpha_running4photon.AND.mu2.LT.HUGE(1d0))alpha_norm=1d0/alpha_ratio_ph(mu2)
+    IF(alpha_running4photon.AND.mu2.LT.HUGE(1d0))alpha_norm=1d0/alpha_ratio_tab(mu2)
   END FUNCTION alpha_norm
 
   SUBROUTINE set_state(x,mx,sreg)
@@ -692,6 +783,11 @@ CONTAINS
        ENDIF
     ENDDO
   END FUNCTION find_frow
+
+  INTEGER FUNCTION inel_rhohat_key() ! (M11) the settings inel_rhohat depends on (as the rows)
+    IMPLICIT NONE
+    inel_rhohat_key=fast_key()
+  END FUNCTION inel_rhohat_key
 
   FUNCTION fast_key() ! the settings the rows depend on
     IMPLICIT NONE
@@ -903,6 +999,9 @@ CONTAINS
     ! from 1e-3 A), the k of the ln Q2 nodes of the G^h tables (the integrand is analytic between them), the mu cuts,
     ! the upper limit. Per panel the six integrands at NLV Chebyshev-Lobatto points (once); per b: Clenshaw-Curtis if
     ! b~ (panel width) <= lev_theta, else Levin collocation (p' + A^T p = (g,0), integral = p.(J_n,J_n+1) at the ends).
+    ! The Levin system of order n is (M_n/b~ + b~ I) p2 = g with M_n independent of b: M_n = Q H Q^T (Hessenberg, per
+    ! panel and n, once), so that per b only (H + b~^2 I) y = b~ Q^T g is solved (O(NLV^2)); the Bessel functions at the
+    ! panel ends are shared by neighbouring panels, J_2 and J_3 by recurrence for z >= 2
     IMPLICIT NONE
     REAL(KIND(1d0)),INTENT(IN)::x
     INTEGER,INTENT(IN)::nb,nmu
@@ -912,17 +1011,51 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(nmu)::kmu
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::e
     REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::G ! (NLV,6,panel)
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::LH,LR,LC ! Levin: H, end rows (Q(1,:),Q(NLV,:),D-rows), Q^T g
     REAL(KIND(1d0)),DIMENSION(6,nmu)::Im
     REAL(KIND(1d0)),DIMENSION(6)::Icum,pk
-    REAL(KIND(1d0)),DIMENSION(6,6)::P
-    REAL(KIND(1d0))::A,hi0,bt,klo,l0,l1,c0,h,z,Jz(0:3),pre,Q2
+    REAL(KIND(1d0))::A,hi0,bt,klo,l0,l1,c0,h,z,Jz(0:3),pre,Q2,bt2
     REAL(KIND(1d0))::Ja(0:3),Jc(0:3),kn(NLV)
-    REAL(KIND(1d0)),DIMENSION(NLV,NLV)::Sm
+    REAL(KIND(1d0)),DIMENSION(NLV,NLV)::Sm,Qm
     REAL(KIND(1d0)),DIMENSION(NLV,3)::Rs
-    REAL(KIND(1d0))::pa1,pc1
-    INTEGER::i,j,m,ngeo,ne,np,k,jj,q,nord,nr,iq(3)
+    REAL(KIND(1d0))::pa1,pc1,p2a,p2c
+    INTEGER::i,j,m,ngeo,ne,np,k,jj,q,nord,kl
+    INTEGER,DIMENSION(:),ALLOCATABLE::mlo,mhi
+    INTEGER,DIMENSION(nmu)::mord
+    ! tree of panels per mu segment (leaves 1..np are the panels): range, children, k range, widest panel, moments of
+    ! the Clenshaw-Curtis sums on the NCT Chebyshev-Lobatto points of the node
+    INTEGER,PARAMETER::NCT=24
+    REAL(KIND(1d0)),PARAMETER::PCT=12d0 ! largest phase b~ (k range) of a node used as a whole (J_n: ~1e-12)
+    REAL(KIND(1d0)),DIMENSION(NCT),SAVE::tct,wct
+    REAL(KIND(1d0)),DIMENSION(NLV,NCT),SAVE::LLT ! Lagrange basis of the tct at the Lobatto points tlv
+    LOGICAL,SAVE::tinit=.FALSE.
+    INTEGER,DIMENSION(:),ALLOCATABLE::nc1,nc2,nlo,nhi,roots,lst
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::na,nbd,nwm
+    REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::MM
+    REAL(KIND(1d0)),DIMENSION(NCT)::lw
+    INTEGER,DIMENSION(64)::stk
+    INTEGER::nn,nseg,nl,nl2,ip,ns,nd,ic
+    REAL(KIND(1d0))::u,ca,cb
+    INTEGER,DIMENSION(0:2),PARAMETER::nrq=(/3,2,1/)
+    INTEGER,DIMENSION(3,0:2),PARAMETER::iqn=RESHAPE((/2,3,6,1,5,0,4,0,0/),(/3,3/)) ! the rows of each order
     CALL inel_init()
     IF(.NOT.lv_init)CALL levin_setup()
+    IF(.NOT.tinit)THEN
+       DO m=1,NCT
+          tct(m)=-DCOS(pi*(m-1)/(NCT-1))
+       ENDDO
+       DO m=1,NCT
+          wct(m)=1d0
+          DO q=1,NCT
+             IF(q.NE.m)wct(m)=wct(m)/(tct(m)-tct(q))
+          ENDDO
+       ENDDO
+       DO jj=1,NLV
+          CALL bary_weights(tlv(jj),lw)
+          LLT(jj,:)=lw
+       ENDDO
+       tinit=.TRUE.
+    ENDIF
     DO m=1,nmu
        kmu(m)=HUGE(1d0)
        IF(mu2v(m).LT.HUGE(1d0))kmu(m)=DSQRT(MAX(mu2v(m)-x**2*mp2,0d0))
@@ -957,77 +1090,280 @@ CONTAINS
        ne=ne+1; e(ne)=hi0
        CALL sort_unique(e,ne,np)
        np=np-1 ! panels e(k),e(k+1), k=1..np
-       ALLOCATE(G(NLV,6,np))
+       ALLOCATE(G(NLV,6,np),LH(NLV,NLV,0:2,np),LR(NLV,4,0:2,np),LC(NLV,3,0:2,np),mlo(np),mhi(np))
+       ! the mu cuts at each panel start e(k): mord(mlo(k):mhi(k))
+       q=0
+       DO k=1,np
+          mlo(k)=q+1
+          DO m=1,nmu
+             IF(kmu(m).EQ.e(k))THEN
+                q=q+1; mord(q)=m
+             ENDIF
+          ENDDO
+          mhi(k)=q
+       ENDDO
        DO k=1,np
           c0=0.5d0*(e(k)+e(k+1)); h=0.5d0*(e(k+1)-e(k))
           DO jj=1,NLV
              CALL rows_at(c0+h*tlv(jj),G(jj,:,k))
           ENDDO
+          IF(e(k).LE.0d0)CYCLE ! Clenshaw-Curtis only
+          kn=c0+h*tlv
+          DO nord=0,2
+             DO jj=1,NLV
+                DO q=1,NLV
+                   Sm(jj,q)=D2lv(jj,q)/h**2-Dlv(jj,q)/h*(nord+1)/kn(q)+nord/kn(jj)*Dlv(jj,q)/h
+                ENDDO
+                Sm(jj,jj)=Sm(jj,jj)-nord*(nord+1)/kn(jj)**2
+             ENDDO
+             CALL hessenberg(NLV,Sm,Qm)
+             LH(:,:,nord,k)=Sm
+             LR(:,1,nord,k)=Qm(1,:); LR(:,2,nord,k)=Qm(NLV,:)
+             LR(:,3,nord,k)=MATMUL(Dlv(1,:),Qm)/h; LR(:,4,nord,k)=MATMUL(Dlv(NLV,:),Qm)/h
+             DO q=1,nrq(nord)
+                LC(:,q,nord,k)=MATMUL(G(:,iqn(q,nord),k),Qm) ! Q^T g
+             ENDDO
+          ENDDO
+       ENDDO
+       ! the trees: segments start at k = 1 and at the panels with mu cuts; leaves' moments from the CC sums, a parent's
+       ! from its children (the parent basis at the children's points: exact, a polynomial of degree NCT-1)
+       ALLOCATE(nc1(2*np),nc2(2*np),nlo(2*np),nhi(2*np),na(2*np),nbd(2*np),nwm(2*np),MM(6,NCT,2*np),roots(np),lst(np))
+       DO k=1,np
+          nc1(k)=0; nc2(k)=0; nlo(k)=k; nhi(k)=k; na(k)=e(k); nbd(k)=e(k+1); nwm(k)=e(k+1)-e(k)
+          h=0.5d0*(e(k+1)-e(k))
+          DO q=1,6
+             MM(q,:,k)=h*MATMUL(wcc*G(:,q,k),LLT)
+          ENDDO
+       ENDDO
+       nn=np; nseg=0; k=1
+       DO WHILE(k.LE.np)
+          ! segment k .. ke
+          ip=k+1
+          DO WHILE(ip.LE.np)
+             IF(mhi(ip).GE.mlo(ip))EXIT
+             ip=ip+1
+          ENDDO
+          nl=0
+          DO q=k,ip-1
+             nl=nl+1; lst(nl)=q
+          ENDDO
+          DO WHILE(nl.GT.1)
+             nl2=0
+             DO q=1,nl-1,2
+                nn=nn+1
+                nc1(nn)=lst(q); nc2(nn)=lst(q+1)
+                nlo(nn)=nlo(lst(q)); nhi(nn)=nhi(lst(q+1)); na(nn)=na(lst(q)); nbd(nn)=nbd(lst(q+1))
+                nwm(nn)=MAX(nwm(lst(q)),nwm(lst(q+1)))
+                MM(:,:,nn)=0d0
+                DO ic=1,2
+                   nd=MERGE(lst(q),lst(q+1),ic.EQ.1)
+                   DO m=1,NCT
+                      ! child point m in the parent's coordinate
+                      u=(2d0*(0.5d0*(na(nd)+nbd(nd))+0.5d0*(nbd(nd)-na(nd))*tct(m))-na(nn)-nbd(nn))/(nbd(nn)-na(nn))
+                      CALL bary_weights(u,lw)
+                      DO jj=1,NCT
+                         MM(:,jj,nn)=MM(:,jj,nn)+MM(:,m,nd)*lw(jj)
+                      ENDDO
+                   ENDDO
+                ENDDO
+                nl2=nl2+1; lst(nl2)=nn
+             ENDDO
+             IF(MOD(nl,2).EQ.1)THEN
+                nl2=nl2+1; lst(nl2)=lst(nl)
+             ENDIF
+             nl=nl2
+          ENDDO
+          nseg=nseg+1; roots(nseg)=lst(1)
+          k=ip
        ENDDO
        DO j=1,nb
           bt=bv(j)/(1d0-x)
           IF(A*bt.GT.Ab_max)CYCLE ! (the b of a row need not be ascending)
+          bt2=bt*bt
           Icum=0d0; Im=0d0
-          DO k=1,np
-             DO m=1,nmu
-                IF(kmu(m).EQ.e(k))Im(:,m)=Icum
-             ENDDO
-             c0=0.5d0*(e(k)+e(k+1)); h=0.5d0*(e(k+1)-e(k))
+          kl=-1 ! the panel end where Jc was last computed
+          DO ns=1,nseg
+           k=nlo(roots(ns))
+           DO m=mlo(k),mhi(k) ! the mu cuts at the start of the segment
+              Im(:,mord(m))=Icum
+           ENDDO
+           ip=1; stk(1)=roots(ns)
+           DO WHILE(ip.GT.0)
+             nd=stk(ip); ip=ip-1
              pk=0d0
+             IF(nc1(nd).GT.0)THEN
+                IF(bt*(nbd(nd)-na(nd)).LE.PCT.AND.bt*nwm(nd).LE.lev_theta)THEN
+                   ! the whole node: Clenshaw-Curtis sums of its panels with J_n interpolated on its Chebyshev points
+                   ca=0.5d0*(na(nd)+nbd(nd)); cb=0.5d0*(nbd(nd)-na(nd))
+                   DO m=1,NCT
+                      CALL bessel_j0123(bt*(ca+cb*tct(m)),Jz,2)
+                      DO q=1,6
+                         pk(q)=pk(q)+MM(q,m,nd)*Jz(row_nj(q))
+                      ENDDO
+                   ENDDO
+                   Icum=Icum+pk
+                ELSE
+                   ip=ip+1; stk(ip)=nc2(nd); ip=ip+1; stk(ip)=nc1(nd)
+                ENDIF
+                CYCLE
+             ENDIF
+             k=nd
+             c0=0.5d0*(e(k)+e(k+1)); h=0.5d0*(e(k+1)-e(k))
              IF(bt*2d0*h.LE.lev_theta.OR.e(k).LE.0d0)THEN ! Clenshaw-Curtis on the Lobatto points
                 DO jj=1,NLV
                    z=bt*(c0+h*tlv(jj))
-                   Jz(0)=BESSEL_J0(z); Jz(1)=BESSEL_J1(z); Jz(2)=BESSEL_JN(2,z)
+                   CALL bessel_j0123(z,Jz,2)
                    DO q=1,6
                       pk(q)=pk(q)+h*wcc(jj)*G(jj,q,k)*Jz(row_nj(q))
                    ENDDO
                 ENDDO
              ELSE ! Levin
-                kn=c0+h*tlv
-                Ja(0)=BESSEL_J0(bt*e(k)); Ja(1)=BESSEL_J1(bt*e(k)); Ja(2)=BESSEL_JN(2,bt*e(k)); Ja(3)=BESSEL_JN(3,bt*e(k))
-                Jc(0)=BESSEL_J0(bt*e(k+1)); Jc(1)=BESSEL_J1(bt*e(k+1)); Jc(2)=BESSEL_JN(2,bt*e(k+1)); Jc(3)=BESSEL_JN(3,bt*e(k+1))
+                IF(kl.EQ.k)THEN
+                   Ja=Jc
+                ELSE
+                   CALL bessel_j0123(bt*e(k),Ja,3)
+                ENDIF
+                CALL bessel_j0123(bt*e(k+1),Jc,3)
+                kl=k+1
                 DO nord=0,2
-                   nr=0
-                   DO q=1,6
-                      IF(row_nj(q).EQ.nord)THEN
-                         nr=nr+1; iq(nr)=q
-                      ENDIF
-                   ENDDO
-                   ! Levin system [D/h+n/k, b; -b, D/h-(n+1)/k] (p1,p2) = (g,0): p1 = (D/h-(n+1)/k) p2/b, so
-                   ! S p2 = g, S = [(D/h+n/k)(D/h-(n+1)/k)]/b + b = [D2/h2 - D/h (n+1)/k + (n/k) D/h - n(n+1)/k2]/b + b
+                   Sm=LH(:,:,nord,k)
                    DO jj=1,NLV
-                      DO q=1,NLV
-                         Sm(jj,q)=(D2lv(jj,q)/h**2-Dlv(jj,q)/h*(nord+1)/kn(q)+nord/kn(jj)*Dlv(jj,q)/h)/bt
-                      ENDDO
-                      Sm(jj,jj)=Sm(jj,jj)-nord*(nord+1)/(kn(jj)**2*bt)+bt
-                      DO q=1,nr
-                         Rs(jj,q)=G(jj,iq(q),k)
-                      ENDDO
+                      Sm(jj,jj)=Sm(jj,jj)+bt2
                    ENDDO
-                   CALL solve_lin(Sm,Rs,NLV,nr)
-                   DO q=1,nr
-                      ! p1 at the ends: (D/h - (n+1)/k) p2 / b at k = a (row 1) and k = c (row NLV)
-                      pa1=DOT_PRODUCT(Dlv(1,:),Rs(:,q))/h; pc1=DOT_PRODUCT(Dlv(NLV,:),Rs(:,q))/h
-                      pa1=(pa1-(nord+1)/kn(1)*Rs(1,q))/bt; pc1=(pc1-(nord+1)/kn(NLV)*Rs(NLV,q))/bt
-                      pk(iq(q))=pc1*Jc(nord)+Rs(NLV,q)*Jc(nord+1)-pa1*Ja(nord)-Rs(1,q)*Ja(nord+1)
+                   Rs(:,1:nrq(nord))=bt*LC(:,1:nrq(nord),nord,k)
+                   CALL solve_hess(NLV,Sm,Rs,nrq(nord))
+                   DO q=1,nrq(nord)
+                      ! p2 and p1 = (D/h - (n+1)/k) p2 / b~ at k = a (row 1) and k = c (row NLV)
+                      p2a=DOT_PRODUCT(LR(:,1,nord,k),Rs(:,q)); p2c=DOT_PRODUCT(LR(:,2,nord,k),Rs(:,q))
+                      pa1=(DOT_PRODUCT(LR(:,3,nord,k),Rs(:,q))-(nord+1)/e(k)*p2a)/bt
+                      pc1=(DOT_PRODUCT(LR(:,4,nord,k),Rs(:,q))-(nord+1)/e(k+1)*p2c)/bt
+                      pk(iqn(q,nord))=pc1*Jc(nord)+p2c*Jc(nord+1)-pa1*Ja(nord)-p2a*Ja(nord+1)
                    ENDDO
                 ENDDO
              ENDIF
              Icum=Icum+pk
+           ENDDO
           ENDDO
           DO m=1,nmu
              IF(kmu(m).GE.hi0)Im(:,m)=Icum
              IF(mu2v(m).LT.HUGE(1d0).AND.A**2.GT.A2_mu*mu2v(m))CYCLE
-             DO q=1,6
-                P(:,q)=Im(:,m)*Im(q,m)
-             ENDDO
              pre=alpha_norm(mu2v(m))/pi**2/(1d0-x)**2
-             Nrow(j,m)=Nrow(j,m)+mx_weights(i)*pre*combination(P,x,mx_nodes(i))
+             Nrow(j,m)=Nrow(j,m)+mx_weights(i)*pre*combination_v(Im(:,m),x,mx_nodes(i))
           ENDDO
        ENDDO
-       DEALLOCATE(e,G)
+       DEALLOCATE(e,G,LH,LR,LC,mlo,mhi,nc1,nc2,nlo,nhi,na,nbd,nwm,MM,roots,lst)
     ENDDO
+  CONTAINS
+    SUBROUTINE bary_weights(uu,ww) ! Lagrange basis of the tct at uu
+      REAL(KIND(1d0)),INTENT(IN)::uu
+      REAL(KIND(1d0)),DIMENSION(NCT),INTENT(OUT)::ww
+      INTEGER::mm
+      mm=MINLOC(ABS(uu-tct),1)
+      IF(ABS(uu-tct(mm)).LT.1d-14)THEN
+         ww=0d0; ww(mm)=1d0
+      ELSE
+         ww=wct/(uu-tct); ww=ww/SUM(ww)
+      ENDIF
+    END SUBROUTINE bary_weights
   END SUBROUTINE lev_row
+
+  SUBROUTINE bessel_j0123(z,J,nmax)
+    ! J_0 .. J_nmax (nmax <= 3) at z >= 0: J_2 = 2 J_1/z - J_0 for z >= 1e-3 (absolute error ~1e-16, as J_0, J_1),
+    ! its series below; J_3 = 4 J_2/z - J_1 for z >= 2, BESSEL_JN below
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::z
+    INTEGER,INTENT(IN)::nmax
+    REAL(KIND(1d0)),DIMENSION(0:3),INTENT(OUT)::J
+    J=0d0
+    J(0)=BESSEL_J0(z); J(1)=BESSEL_J1(z)
+    IF(z.GE.1d-3)THEN
+       J(2)=2d0*J(1)/z-J(0)
+    ELSE
+       J(2)=z*z/8d0*(1d0-z*z/12d0)
+    ENDIF
+    IF(nmax.GE.3)THEN
+       IF(z.GE.2d0)THEN
+          J(3)=4d0*J(2)/z-J(1)
+       ELSE
+          J(3)=BESSEL_JN(3,z)
+       ENDIF
+    ENDIF
+  END SUBROUTINE bessel_j0123
+
+  SUBROUTINE hessenberg(n,A,Q) ! A -> H = Q^T A Q upper Hessenberg (Householder), Q orthogonal
+    IMPLICIT NONE
+    INTEGER,INTENT(IN)::n
+    REAL(KIND(1d0)),DIMENSION(n,n),INTENT(INOUT)::A
+    REAL(KIND(1d0)),DIMENSION(n,n),INTENT(OUT)::Q
+    REAL(KIND(1d0)),DIMENSION(n)::v,w
+    REAL(KIND(1d0))::al,vn
+    INTEGER::k,i
+    Q=0d0
+    DO i=1,n
+       Q(i,i)=1d0
+    ENDDO
+    DO k=1,n-2
+       al=DSQRT(SUM(A(k+1:n,k)**2))
+       IF(al.EQ.0d0)CYCLE
+       IF(A(k+1,k).GT.0d0)al=-al
+       v=0d0
+       v(k+1:n)=A(k+1:n,k)
+       v(k+1)=v(k+1)-al
+       vn=SUM(v(k+1:n)**2)
+       IF(vn.EQ.0d0)CYCLE
+       ! A = P A P, Q = Q P, P = I - 2 v v^T/vn
+       w=MATMUL(v(k+1:n),A(k+1:n,:))
+       DO i=k+1,n
+          A(i,:)=A(i,:)-(2d0/vn)*v(i)*w
+       ENDDO
+       w=MATMUL(A(:,k+1:n),v(k+1:n))
+       DO i=k+1,n
+          A(:,i)=A(:,i)-(2d0/vn)*w*v(i)
+       ENDDO
+       w=MATMUL(Q(:,k+1:n),v(k+1:n))
+       DO i=k+1,n
+          Q(:,i)=Q(:,i)-(2d0/vn)*w*v(i)
+       ENDDO
+       A(k+2:n,k)=0d0
+    ENDDO
+  END SUBROUTINE hessenberg
+
+  SUBROUTINE solve_hess(n,H,R,nr) ! H X = R for upper Hessenberg H (pivoting between adjacent rows), X in R(:,1:nr)
+    IMPLICIT NONE
+    INTEGER,INTENT(IN)::n,nr
+    REAL(KIND(1d0)),DIMENSION(n,n),INTENT(INOUT)::H
+    REAL(KIND(1d0)),DIMENSION(:,:),INTENT(INOUT)::R
+    REAL(KIND(1d0))::f,t
+    INTEGER::i,j,l
+    DO i=1,n-1
+       IF(ABS(H(i+1,i)).GT.ABS(H(i,i)))THEN
+          DO l=i,n
+             t=H(i,l); H(i,l)=H(i+1,l); H(i+1,l)=t
+          ENDDO
+          DO l=1,nr
+             t=R(i,l); R(i,l)=R(i+1,l); R(i+1,l)=t
+          ENDDO
+       ENDIF
+       f=H(i+1,i)/H(i,i)
+       IF(f.NE.0d0)THEN
+          DO l=i+1,n
+             H(i+1,l)=H(i+1,l)-f*H(i,l)
+          ENDDO
+          DO l=1,nr
+             R(i+1,l)=R(i+1,l)-f*R(i,l)
+          ENDDO
+       ENDIF
+    ENDDO
+    DO i=n,1,-1
+       DO l=1,nr
+          t=R(i,l)
+          DO j=i+1,n
+             t=t-H(i,j)*R(j,l)
+          ENDDO
+          R(i,l)=t/H(i,i)
+       ENDDO
+    ENDDO
+  END SUBROUTINE solve_hess
 
   ! ================================================================ fast rows with rho (rho_model /= 0)
   SUBROUTINE fast_row_compute(x,nb,bv,nmu,mu2v,Nrow)
@@ -1348,7 +1684,7 @@ CONTAINS
     ENDDO
   END SUBROUTINE amps_mu
 
-  SUBROUTINE rho_phat_mu(nmu,kcv,hi0,nD,Dv,e,np,G,Ph)
+  SUBROUTINE rho_phat_mu(nmu,kcv,hi0,nD,Dv,e,np,G,Ph,COARSE)
     ! P^_pq(Delta) = R(p,q) + R(q,p), R(p,q) = int dk1 f_p(k1) int dpsi 2 f_q(k2)/k2 cos(n phi) over the half plane
     ! k2 >= k1 (from int J_n J_n J_0 t dt = cos(n phi)/(2 pi area)), for all cuts kcv at once: for k1 < kc - Delta the
     ! inner integral is independent of kc, so a prefix sum over k1 serves all cuts and only k1 in [kc - Delta, kc) is
@@ -1365,6 +1701,8 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(np+1),INTENT(IN)::e
     REAL(KIND(1d0)),DIMENSION(NLV,6,np),INTENT(IN)::G
     REAL(KIND(1d0)),DIMENSION(6,6,nD,nmu),INTENT(OUT)::Ph
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::COARSE ! (M11) > 0: outer panels geometric 6 per decade from COARSE to hi0
+                                                ! (and the special points) instead of the node panels
     REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::o,sq
     REAL(KIND(1d0)),DIMENSION(6)::f1,Phi
     REAL(KIND(1d0)),DIMENSION(6,6)::Rs
@@ -1379,6 +1717,14 @@ CONTAINS
     LOGICAL::sqe
     REAL(KIND(1d0))::sj
     INTEGER,DIMENSION(14)::pp,qq
+    ! (M13, COARSE only) k1 < ks = 0.1 D with no cut inside the inner range and hi0 > D + ks: the inner integral
+    ! interpolated from NS Chebyshev points of [0, ks] (k2 within D (1 +- 0.1): smooth in k1)
+    INTEGER,PARAMETER::NS=6
+    REAL(KIND(1d0)),DIMENSION(NS)::tsn,lw
+    REAL(KIND(1d0)),DIMENSION(6,NS)::PhiS
+    REAL(KIND(1d0)),DIMENSION(6,1)::Pd
+    REAL(KIND(1d0))::ks
+    INTEGER::js,jl
     kc=MIN(kcv,hi0)
     npr=0 ! the pairs with the same Bessel order
     DO p=1,6
@@ -1416,14 +1762,24 @@ CONTAINS
           ENDDO
           CYCLE
        ENDIF
-       ALLOCATE(o(np+3*nmu+3),sq(nmu+1))
        nsq=0
        no=0
-       DO k=1,np+1
-          IF(e(k).LT.hi0)THEN
-             no=no+1; o(no)=e(k)
-          ENDIF
-       ENDDO
+       IF(PRESENT(COARSE))THEN
+          nn=MAX(1,CEILING(6d0*LOG10(MAX(hi0/COARSE,10d0))))
+          ALLOCATE(o(nn+3*nmu+5),sq(nmu+1))
+          no=1; o(1)=0d0
+          DO k=0,nn
+             no=no+1; o(no)=COARSE*(hi0/COARSE)**(DBLE(k)/nn)
+          ENDDO
+          no=no-1 ! hi0 itself is added below
+       ELSE
+          ALLOCATE(o(np+3*nmu+3),sq(nmu+1))
+          DO k=1,np+1
+             IF(e(k).LT.hi0)THEN
+                no=no+1; o(no)=e(k)
+             ENDIF
+          ENDDO
+       ENDIF
        no=no+1; o(no)=hi0
        IF(0.5d0*D.LT.hi0)THEN
           no=no+1; o(no)=0.5d0*D
@@ -1439,6 +1795,17 @@ CONTAINS
              nsq=nsq+1; sq(nsq)=D-kc(m)
           ENDIF
        ENDDO
+       ks=0d0
+       IF(PRESENT(COARSE))THEN
+          IF(hi0.GT.1.1d0*D.AND.0.1d0*D.GT.COARSE)THEN
+             ks=0.1d0*D
+             no=no+1; o(no)=ks
+             DO js=1,NS
+                tsn(js)=0.5d0*ks*(1d0-DCOS((2*js-1)*pi/(2*NS)))
+                CALL inner_phi_cc(tsn(js),D,hi0,0,kc(1:0),e,np,G,PhiS(:,js),Pd(:,1:0))
+             ENDDO
+          ENDIF
+       ENDIF
        CALL sort_unique(o,no,nn)
        Rs=0d0; Rpart=0d0; based=.FALSE.; Rb=0d0
        DO k=1,nn-1
@@ -1467,7 +1834,17 @@ CONTAINS
                 IF(k1.LT.kc(m)-D.OR.k1.GE.kc(m))CYCLE
                 nc=nc+1; ic(nc)=m; kcc(nc)=kc(m)
              ENDDO
-             CALL inner_phi_cc(k1,D,hi0,nc,kcc(1:nc),e,np,G,Phi,Phic(:,1:nc))
+             IF(k1.LT.ks.AND.nc.EQ.0)THEN
+                DO js=1,NS
+                   lw(js)=1d0
+                   DO jl=1,NS
+                      IF(jl.NE.js)lw(js)=lw(js)*(k1-tsn(jl))/(tsn(js)-tsn(jl))
+                   ENDDO
+                ENDDO
+                Phi=MATMUL(PhiS,lw)
+             ELSE
+                CALL inner_phi_cc(k1,D,hi0,nc,kcc(1:nc),e,np,G,Phi,Phic(:,1:nc))
+             ENDIF
              DO ipr=1,npr
                 Rs(pp(ipr),qq(ipr))=Rs(pp(ipr),qq(ipr))+w1*f1(pp(ipr))*Phi(qq(ipr))
              ENDDO
@@ -1624,6 +2001,443 @@ CONTAINS
     ENDDO
   END SUBROUTINE rho_row
 
+
+  SUBROUTINE inel_rhohat(x,nq,qv,nmu,mu2v,R)
+    ! (M11) the two-dimensional Fourier transform of the b-space density at one x: R(iq,m) = int d^2b exp(-i q.b)
+    ! x f/alpha(b) at q = qv(iq) (GeV) and mu2v(m), every rho_model: per mx node w alpha_norm/pi^2 combination of
+    ! the momentum-space overlaps P^(Delta) at Delta = q (1-x) (rho_phat_mu), times exp(-B Delta^2) in the
+    ! continuum, the source rule inside the W^2 step (rho /= delta); rho = delta: P^ for every node
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::nq,nmu
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(IN)::qv
+    REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::mu2v
+    REAL(KIND(1d0)),DIMENSION(nq,nmu),INTENT(OUT)::R
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::e,e2
+    REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::G,G2
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Ph,Ph2,Phs
+    REAL(KIND(1d0)),DIMENSION(nq)::Dv
+    REAL(KIND(1d0)),DIMENSION(nmu)::kcv
+    INTEGER,DIMENSION(nmu)::ima
+    REAL(KIND(1d0)),DIMENSION(6,6)::Pm
+    REAL(KIND(1d0))::A,hi0,sw,Bs,pre
+    INTEGER::i,m,ma,nma,np,np2,iq
+    CALL inel_init()
+    IF(.NOT.lv_init)CALL levin_setup()
+    Dv=qv*(1d0-x)
+    R=0d0
+    DO i=1,NMX
+       A=DSQRT(A2(x,mx_nodes(i)))
+       hi0=kT_hi(x,mx_nodes(i),HUGE(1d0))
+       nma=0
+       DO m=1,nmu
+          IF(mu2v(m).LT.HUGE(1d0).AND.A**2.GT.A2_mu*mu2v(m))CYCLE
+          nma=nma+1; ima(nma)=m; kcv(nma)=kT_hi(x,mx_nodes(i),mu2v(m))
+       ENDDO
+       IF(nma.EQ.0)CYCLE
+       sw=0d0; Bs=0d0
+       IF(rho_model.NE.0)THEN
+          sw=W_step(mx_nodes(i))
+          Bs=B_slope(xB(mx_nodes(i),A**2/(1d0-x)))
+       ENDIF
+       CALL node_panels_mu(x,mx_nodes(i),hi0,nma,kcv(1:nma),0d0,e,np,G)
+       ALLOCATE(Ph(6,6,nq,nma),Ph2(6,6,nq,nma),Phs(6,6,nq,nma))
+       Ph2=0d0; Phs=0d0
+       IF(rhohat_fast)THEN
+          CALL rho_phat_fast(nma,kcv(1:nma),hi0,A,nq,Dv,e,np,G,Ph)
+       ELSE
+          CALL rho_phat_mu(nma,kcv(1:nma),hi0,nq,Dv,e,np,G,Ph)
+       ENDIF
+       IF(sw.GT.0d0.AND.sw.LT.1d0)THEN
+          ! the mixed products [rho(k) F] G + F [rho(k) G]: P^[G+G2] - P^[G] - P^[G2] (bilinear), G2 = G exp(-B k^2)
+          CALL node_panels_mu(x,mx_nodes(i),hi0,nma,kcv(1:nma),Bs,e2,np2,G2)
+          IF(rhohat_fast)THEN
+             CALL rho_phat_fast(nma,kcv(1:nma),hi0,A,nq,Dv,e2,np2,G2,Ph2)
+             G2=G2+G
+             CALL rho_phat_fast(nma,kcv(1:nma),hi0,A,nq,Dv,e2,np2,G2,Phs)
+          ELSE
+             CALL rho_phat_mu(nma,kcv(1:nma),hi0,nq,Dv,e2,np2,G2,Ph2)
+             G2=G2+G
+             CALL rho_phat_mu(nma,kcv(1:nma),hi0,nq,Dv,e2,np2,G2,Phs)
+          ENDIF
+       ENDIF
+       DO ma=1,nma
+          m=ima(ma)
+          pre=mx_weights(i)*alpha_norm(mu2v(m))/pi**2
+          DO iq=1,nq
+             IF(sw.LE.0d0)THEN
+                Pm=Ph(:,:,iq,ma)
+             ELSEIF(sw.GE.1d0)THEN
+                Pm=DEXP(-Bs*Dv(iq)**2)*Ph(:,:,iq,ma)
+             ELSE
+                Pm=sw**2*DEXP(-Bs*Dv(iq)**2)*Ph(:,:,iq,ma)+sw*(1d0-sw)*(Phs(:,:,iq,ma)-Ph(:,:,iq,ma)-Ph2(:,:,iq,ma))&
+                     +(1d0-sw)**2*Ph(:,:,iq,ma)
+             ENDIF
+             R(iq,m)=R(iq,m)+pre*combination(Pm,x,mx_nodes(i))
+          ENDDO
+       ENDDO
+       DEALLOCATE(Ph,Ph2,Phs,e,G)
+       IF(ALLOCATED(G2))DEALLOCATE(e2,G2)
+    ENDDO
+  END SUBROUTINE inel_rhohat
+
+
+  SUBROUTINE rho_phat_fast(nmu,kcv,hi0,Anode,nD,Dv,e,np,G,Ph)
+    ! (M11) rho_phat_mu with the outer k1 integral of R(p,q) = int dk1 f_p(k1) Phi_q(k1,D) split as
+    !   pi int_0^kc f_p f_q/k                                  (Parseval half, cumulative per node)
+    ! + int_0^kL f_p (Phi_q - pi f_q/k1)                       (exact: inner_phi_cc, kL = min(KF D, kc_min - D))
+    ! + D int_kL^(kc-D) f_p (2 f_q' - f_q/k)/k
+    ! + D^2 pi/4 int_kL^(kc-D) f_p (k f_q'' - f_q' + (1-n^2) f_q/k)/k^2   (the inner integral to O((D/k1)^2))
+    ! + int_(kc-D)^kc f_p (Phi_q^(kc) - pi f_q/k1)             (exact band of each cut, k1 = a + (b-a) s^2)
+    ! Outer panels of the exact part: geometric NGO per decade from 1e-3 min(D, A), 0.5 D (square-root onset); below
+    ! 0.1 D the inner integral interpolated from 6 Chebyshev points (M12); D < A/KA: the expansion throughout.
+    ! Bands: kc >= 300 D leading order -2 D f_p f_q/kc, 30 D <= kc < 300 D with the D^2 term from one exact band
+    ! per cut (M12), else exact (Gauss-Legendre 5). The cuts with kc < 3 D (and D <= 0): rho_phat_mu
+    IMPLICIT NONE
+    INTEGER,INTENT(IN)::nmu,nD,np
+    REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::kcv
+    REAL(KIND(1d0)),INTENT(IN)::hi0,Anode
+    REAL(KIND(1d0)),DIMENSION(nD),INTENT(IN)::Dv
+    REAL(KIND(1d0)),DIMENSION(np+1),INTENT(IN)::e
+    REAL(KIND(1d0)),DIMENSION(NLV,6,np),INTENT(IN)::G
+    REAL(KIND(1d0)),DIMENSION(6,6,nD,nmu),INTENT(OUT)::Ph
+    REAL(KIND(1d0)),PARAMETER::KF=20d0,KA=50d0
+    INTEGER,PARAMETER::NGO=6
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Pcum ! (6,6,3,np+1) prefix sums of the panel integrals
+    REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::Gd1,Gd2
+    REAL(KIND(1d0)),DIMENSION(6,6,3)::c1,c2
+    REAL(KIND(1d0)),DIMENSION(6,6)::Rs,Rm
+    REAL(KIND(1d0)),DIMENSION(6)::f1,Phi
+    REAL(KIND(1d0)),DIMENSION(6,1)::Phic
+    REAL(KIND(1d0)),DIMENSION(nmu)::kc
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Phs
+    INTEGER,DIMENSION(nmu)::isl,ifa
+    INTEGER::nsl,nfa,ms
+    REAL(KIND(1d0))::kcf
+    REAL(KIND(1d0)),DIMENSION(nmu)::kLm
+    REAL(KIND(1d0)),DIMENSION(6,6,nmu)::Rsn
+    REAL(KIND(1d0))::D,kL,klo,l0,l1,a,b,k1,w1,sj,h
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::oe
+    INTEGER::id,k,j,m,no,nn,ipr,npr,hint,ip
+    INTEGER,DIMENSION(14)::pp,qq
+    LOGICAL::sqp
+    ! (M12) cumulative kernels at each cut and the integrands there (independent of D); the region k1 < KSM D of
+    ! the exact part from the inner integral at NS Chebyshev points of [0, KSM D] (smooth in k1 there: k2 within
+    ! D (1 +- KSM)), interpolated
+    REAL(KIND(1d0)),PARAMETER::KSM=0.1d0
+    INTEGER,PARAMETER::NS=6
+    REAL(KIND(1d0)),DIMENSION(6,6,3,nmu)::Ckc
+    REAL(KIND(1d0)),DIMENSION(6,nmu)::fkc
+    REAL(KIND(1d0)),DIMENSION(6,6,3)::cKF
+    REAL(KIND(1d0)),DIMENSION(NS)::tsn,lw
+    REAL(KIND(1d0)),DIMENSION(6,NS)::PhiS
+    REAL(KIND(1d0))::ks
+    INTEGER::js,jl
+    ! (M12) bands of the cuts with rhohat_kb2 D <= kc < rhohat_kb D: -2 D f_p f_q/kc + c2 D^2, c2 from one exact band
+    ! at D0 = kc/100 per cut
+    REAL(KIND(1d0)),DIMENSION(6,6,nmu)::c2b
+    LOGICAL,DIMENSION(nmu)::c2set
+    REAL(KIND(1d0)),DIMENSION(5),PARAMETER::t5=(/-0.906179845938663992797626878299d0,-0.538469310105683091036314420700d0,&
+         0d0,0.538469310105683091036314420700d0,0.906179845938663992797626878299d0/)
+    REAL(KIND(1d0)),DIMENSION(5),PARAMETER::w5=(/0.236926885056189087514264040720d0,0.478628670499366468041291514836d0,&
+         0.568888888888888888888888888889d0,0.478628670499366468041291514836d0,0.236926885056189087514264040720d0/)
+    kc=MIN(kcv,hi0)
+    npr=0
+    DO ip=1,6
+       DO k=1,6
+          IF(row_nj(ip).EQ.row_nj(k))THEN
+             npr=npr+1; pp(npr)=ip; qq(npr)=k
+          ENDIF
+       ENDDO
+    ENDDO
+    ! derivatives at the Lobatto points and the prefix sums of the three kernels
+    ALLOCATE(Gd1(NLV,6,np),Gd2(NLV,6,np),Pcum(6,6,3,np+1))
+    DO k=1,np
+       h=0.5d0*(e(k+1)-e(k))
+       Gd1(:,:,k)=MATMUL(Dlv,G(:,:,k))/h
+       Gd2(:,:,k)=MATMUL(D2lv,G(:,:,k))/h**2
+    ENDDO
+    Pcum(:,:,:,1)=0d0
+    DO k=1,np
+       CALL panel_ints(k,e(k),e(k+1),c1)
+       Pcum(:,:,:,k+1)=Pcum(:,:,:,k)+c1
+    ENDDO
+    DO m=1,nmu
+       CALL cum_at(kc(m),Ckc(:,:,:,m))
+       CALL cheb_eval(kc(m),e,np,G,fkc(:,m))
+    ENDDO
+    c2set=.FALSE.
+    DO id=1,nD
+       D=Dv(id)
+       nsl=0; nfa=0
+       DO m=1,nmu
+          IF(D.LE.0d0.OR.kc(m).LT.rhohat_kf*D)THEN
+             nsl=nsl+1; isl(nsl)=m
+          ELSE
+             nfa=nfa+1; ifa(nfa)=m
+          ENDIF
+       ENDDO
+       IF(nsl.GT.0)THEN
+          ALLOCATE(Phs(6,6,1,nsl))
+          ! the largest of these cuts as the upper limit (the same values: k2 <= kc for every cut passed)
+          CALL rho_phat_mu(nsl,kc(isl(1:nsl)),MAXVAL(kc(isl(1:nsl))),1,Dv(id:id),e,np,G,Phs,&
+               COARSE=1d-3*MIN(D,Anode,MINVAL(kc(isl(1:nsl)))))
+          DO ms=1,nsl
+             Ph(:,:,id,isl(ms))=Phs(:,:,1,ms)
+          ENDDO
+          DEALLOCATE(Phs)
+       ENDIF
+       IF(nfa.EQ.0)CYCLE
+       ! per fast cut the end of its exact part kL(m) = min(KF D, kc - D): one pass over [0, max kL] with the
+       ! exact integral kept at each kL(m)
+       kcf=0d0
+       DO ms=1,nfa
+          kLm(ms)=MIN(KF*D,kc(ifa(ms))-D); kcf=MAX(kcf,kLm(ms))
+       ENDDO
+       kL=kcf
+       klo=1d-3*MIN(D,Anode)
+       IF(ALLOCATED(oe))DEALLOCATE(oe)
+       ALLOCATE(oe(NGO*CEILING(MAX(LOG10(MAX(kL,klo)/klo),1d0))+nfa+8))
+       no=1; oe(1)=0d0
+       IF(klo.LT.kL)THEN
+          l0=LOG10(klo); l1=LOG10(kL)
+          nn=MAX(1,CEILING(NGO*(l1-l0)))
+          DO k=0,nn
+             no=no+1; oe(no)=10d0**(l0+(l1-l0)*k/nn)
+          ENDDO
+       ELSE
+          no=no+1; oe(no)=kL
+       ENDIF
+       IF(0.5d0*D.LT.kL)THEN
+          no=no+1; oe(no)=0.5d0*D
+       ENDIF
+       ks=KSM*D
+       IF(ks.LT.kL.AND.ks.GT.klo)THEN
+          no=no+1; oe(no)=ks
+          DO js=1,NS ! Chebyshev-Gauss points of [0,ks] and the inner integrals there
+             tsn(js)=0.5d0*ks*(1d0-DCOS((2*js-1)*pi/(2*NS)))
+             CALL inner_phi_cc(tsn(js),D,hi0,0,kc(1:0),e,np,G,PhiS(:,js),Phic(:,1:0),.TRUE.)
+          ENDDO
+       ELSE
+          ks=0d0
+       ENDIF
+       DO ms=1,nfa
+          no=no+1; oe(no)=kLm(ms)
+       ENDDO
+       CALL sort_unique(oe,no,nn)
+       Rs=0d0; hint=0
+       ! D << A: the expansion in D throughout (no exact part)
+       IF(KA*D.LT.Anode)THEN
+          nn=1; kLm(1:nfa)=0d0
+       ENDIF
+       DO ms=1,nfa
+          IF(kLm(ms).LE.0d0)Rsn(:,:,ms)=0d0
+       ENDDO
+       DO k=1,nn-1
+          a=oe(k); b=oe(k+1)
+          sqp=ABS(a-0.5d0*D).LE.1d-13*D
+          DO j=1,8
+             IF(sqp)THEN
+                sj=0.5d0*(1d0+t8(j)); k1=a+(b-a)*sj**2; w1=(b-a)*sj*w8(j)
+             ELSE
+                k1=0.5d0*(a+b)+0.5d0*(b-a)*t8(j); w1=0.5d0*(b-a)*w8(j)
+             ENDIF
+             CALL cheb_eval(k1,e,np,G,f1,hint)
+             IF(k1.LT.ks)THEN
+                DO js=1,NS
+                   lw(js)=1d0
+                   DO jl=1,NS
+                      IF(jl.NE.js)lw(js)=lw(js)*(k1-tsn(jl))/(tsn(js)-tsn(jl))
+                   ENDDO
+                ENDDO
+                Phi=MATMUL(PhiS,lw)
+             ELSE
+                CALL inner_phi_cc(k1,D,hi0,0,kc(1:0),e,np,G,Phi,Phic(:,1:0),.TRUE.)
+             ENDIF
+             DO ipr=1,npr
+                Rs(pp(ipr),qq(ipr))=Rs(pp(ipr),qq(ipr))+w1*f1(pp(ipr))*(Phi(qq(ipr))-pi*f1(qq(ipr))/k1)
+             ENDDO
+          ENDDO
+          DO ms=1,nfa
+             IF(ABS(b-kLm(ms)).LE.1d-13*b)Rsn(:,:,ms)=Rs
+          ENDDO
+       ENDDO
+       IF(KA*D.LT.Anode)THEN
+          cKF=0d0
+       ELSE
+          CALL cum_at(KF*D,cKF)
+       ENDIF
+       DO ms=1,nfa
+          m=ifa(ms)
+          IF(kLm(ms).LE.0d0)THEN
+             c1=0d0
+          ELSEIF(ABS(kLm(ms)-KF*D).LE.1d-13*kLm(ms))THEN
+             c1=cKF
+          ELSE
+             CALL cum_at(kLm(ms),c1)
+          ENDIF
+          Rm=Rsn(:,:,ms)+pi*Ckc(:,:,1,m)
+          IF(kc(m).GE.rhohat_kb*D)THEN ! the tail kernels at kc - D as at kc: O((D/kc)^2)
+             c2=Ckc(:,:,:,m)
+          ELSE
+             CALL cum_at(kc(m)-D,c2)
+          ENDIF
+          Rm=Rm+D*(c2(:,:,2)-c1(:,:,2))+D**2*0.25d0*pi*(c2(:,:,3)-c1(:,:,3))
+          ! band [kc-D, kc): kc >= rhohat_kb D: -2 D f_p f_q/kc (leading order in D/kc), else exact
+          IF(kc(m).GE.rhohat_kb*D)THEN
+             DO ipr=1,npr
+                Rm(pp(ipr),qq(ipr))=Rm(pp(ipr),qq(ipr))-2d0*D*fkc(pp(ipr),m)*fkc(qq(ipr),m)/kc(m)
+             ENDDO
+             Ph(:,:,id,m)=Rm+TRANSPOSE(Rm)
+             CYCLE
+          ENDIF
+          IF(kc(m).GE.rhohat_kb2*D)THEN
+             IF(.NOT.c2set(m))THEN
+                CALL band_exact(m,0.01d0*kc(m),Rs)
+                DO ipr=1,npr
+                   c2b(pp(ipr),qq(ipr),m)=(Rs(pp(ipr),qq(ipr))+2d0*0.01d0*kc(m)*fkc(pp(ipr),m)*fkc(qq(ipr),m)/kc(m))&
+                        /(0.01d0*kc(m))**2
+                ENDDO
+                c2set(m)=.TRUE.
+             ENDIF
+             DO ipr=1,npr
+                Rm(pp(ipr),qq(ipr))=Rm(pp(ipr),qq(ipr))-2d0*D*fkc(pp(ipr),m)*fkc(qq(ipr),m)/kc(m)&
+                     +c2b(pp(ipr),qq(ipr),m)*D**2
+             ENDDO
+          ELSE
+             CALL band_exact(m,D,Rs)
+             Rm=Rm+Rs
+          ENDIF
+          Ph(:,:,id,m)=Rm+TRANSPOSE(Rm)
+       ENDDO
+    ENDDO
+    DEALLOCATE(Gd1,Gd2,Pcum)
+  CONTAINS
+    SUBROUTINE band_exact(mm,DD,Rb)
+      ! int_(kc-DD)^kc f_p (Phi_q^(kc) - pi f_q/k1) dk1 of cut mm (Gauss-Legendre 5 in s, k1 = a + (b-a) s^2)
+      INTEGER,INTENT(IN)::mm
+      REAL(KIND(1d0)),INTENT(IN)::DD
+      REAL(KIND(1d0)),DIMENSION(6,6),INTENT(OUT)::Rb
+      REAL(KIND(1d0)),DIMENSION(6)::fb,Pb
+      REAL(KIND(1d0)),DIMENSION(6,1)::Pc
+      REAL(KIND(1d0))::aa,bb,kk,ww,ss
+      INTEGER::jj,ii
+      Rb=0d0
+      aa=kc(mm)-DD; bb=kc(mm)
+      DO jj=1,5
+         ss=0.5d0*(1d0+t5(jj)); kk=aa+(bb-aa)*ss**2; ww=(bb-aa)*ss*w5(jj)
+         CALL cheb_eval(kk,e,np,G,fb)
+         IF(kc(mm).LT.hi0)THEN
+            CALL inner_phi_cc(kk,DD,hi0,1,kc(mm:mm),e,np,G,Pb,Pc)
+            Pb=Pc(:,1)
+         ELSE
+            CALL inner_phi_cc(kk,DD,hi0,0,kc(1:0),e,np,G,Pb,Pc(:,1:0))
+         ENDIF
+         DO ii=1,npr
+            Rb(pp(ii),qq(ii))=Rb(pp(ii),qq(ii))+ww*fb(pp(ii))*(Pb(qq(ii))-pi*fb(qq(ii))/kk)
+         ENDDO
+      ENDDO
+    END SUBROUTINE band_exact
+    SUBROUTINE panel_ints(kp,ua,ub,cc)
+      ! the three kernels integrated over [ua,ub] inside panel kp (Gauss-Legendre 8)
+      INTEGER,INTENT(IN)::kp
+      REAL(KIND(1d0)),INTENT(IN)::ua,ub
+      REAL(KIND(1d0)),DIMENSION(6,6,3),INTENT(OUT)::cc
+      REAL(KIND(1d0)),DIMENSION(6)::f,fd,fdd
+      REAL(KIND(1d0))::kk,ww,tt
+      INTEGER::jj,ii,p,q,nq
+      cc=0d0
+      IF(ub.LE.ua)RETURN
+      DO jj=1,8
+         kk=0.5d0*(ua+ub)+0.5d0*(ub-ua)*t8(jj); ww=0.5d0*(ub-ua)*w8(jj)
+         tt=(2d0*kk-e(kp)-e(kp+1))/(e(kp+1)-e(kp))
+         DO ii=1,6
+            f(ii)=bary(tt,G(:,ii,kp)); fd(ii)=bary(tt,Gd1(:,ii,kp)); fdd(ii)=bary(tt,Gd2(:,ii,kp))
+         ENDDO
+         DO ii=1,npr
+            p=pp(ii); q=qq(ii); nq=row_nj(q)
+            cc(p,q,1)=cc(p,q,1)+ww*f(p)*f(q)/kk
+            cc(p,q,2)=cc(p,q,2)+ww*f(p)*(2d0*fd(q)-f(q)/kk)/kk
+            cc(p,q,3)=cc(p,q,3)+ww*f(p)*(kk*fdd(q)-fd(q)+(1-nq**2)*f(q)/kk)/kk**2
+         ENDDO
+      ENDDO
+    END SUBROUTINE panel_ints
+    SUBROUTINE cum_at(ku,cc)
+      ! the three kernels integrated over [0,ku]
+      REAL(KIND(1d0)),INTENT(IN)::ku
+      REAL(KIND(1d0)),DIMENSION(6,6,3),INTENT(OUT)::cc
+      REAL(KIND(1d0)),DIMENSION(6,6,3)::cp
+      INTEGER::lo,hi,mid
+      IF(ku.LE.e(1))THEN
+         cc=0d0; RETURN
+      ENDIF
+      IF(ku.GE.e(np+1))THEN
+         cc=Pcum(:,:,:,np+1); RETURN
+      ENDIF
+      lo=1; hi=np+1
+      DO WHILE(hi-lo.GT.1)
+         mid=(lo+hi)/2
+         IF(ku.GE.e(mid))THEN
+            lo=mid
+         ELSE
+            hi=mid
+         ENDIF
+      ENDDO
+      CALL panel_ints(lo,e(lo),ku,cp)
+      cc=Pcum(:,:,:,lo)+cp
+    END SUBROUTINE cum_at
+  END SUBROUTINE rho_phat_fast
+
+
+  SUBROUTINE elastic_rhohat(x,iFF,nq,qv,R)
+    ! (M11) the two-dimensional Fourier transform of the exact elastic density of the proton (alpha(0) normalisation,
+    ! as PhotonNumberDensity_ChargeFormFactor_proton_exact) at q = qv (GeV): exact_combination of the pair overlaps
+    ! P^(q (1-x)) of its six k_T integrands (rho_phat_fast), divided by pi^2. Panels: geometric 10/decade from
+    ! 1e-3 x mp to k_T at Q2 = 1e4 GeV^2, the joins of the form factors
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::iFF,nq
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(IN)::qv
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(OUT)::R
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::t,ej
+    REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::G
+    REAL(KIND(1d0)),DIMENSION(:,:,:,:),ALLOCATABLE::Ph
+    REAL(KIND(1d0)),DIMENSION(6,NLV)::V
+    REAL(KIND(1d0))::A,hi,klo,l0,l1,c0,h
+    INTEGER::k,ngeo,ne,np,iq
+    IF(.NOT.lv_init)CALL levin_setup()
+    R=0d0
+    IF(x.GE.1d0)RETURN
+    A=x*mp
+    hi=DSQRT(MAX(1d4*(1d0-x)-A**2,1d-6))
+    klo=1d-3*MIN(A,hi)
+    ngeo=INT(10*LOG10(hi/klo))+2
+    ej=proton_exact_edges(x,iFF)
+    ALLOCATE(t(ngeo+SIZE(ej)+2))
+    l0=LOG10(klo); l1=LOG10(hi)
+    DO k=0,ngeo-1
+       t(k+1)=10d0**(l0+k*((l1-l0)/(ngeo-1)))
+    ENDDO
+    ne=ngeo+1; t(ne)=0d0
+    DO k=1,SIZE(ej)
+       IF(ej(k).LT.hi)THEN
+          ne=ne+1; t(ne)=ej(k)
+       ENDIF
+    ENDDO
+    CALL sort_unique(t,ne,np)
+    np=np-1
+    ALLOCATE(G(NLV,6,np),Ph(6,6,nq,1))
+    DO k=1,np
+       c0=0.5d0*(t(k)+t(k+1)); h=0.5d0*(t(k+1)-t(k))
+       CALL proton_exact_kspace(x,iFF,NLV,c0+h*tlv,V)
+       G(:,:,k)=TRANSPOSE(V)
+    ENDDO
+    CALL rho_phat_fast(1,(/hi/),hi,A,nq,qv*(1d0-x),t(1:np+1),np,G,Ph)
+    DO iq=1,nq
+       R(iq)=proton_exact_comb_P(x,Ph(:,:,iq,1))/pi**2
+    ENDDO
+  END SUBROUTINE elastic_rhohat
+
   SUBROUTINE cheb_setup(n,xc,wt,cm)
     ! n Chebyshev-Lobatto points xc(i) = cos(pi (i-1)/(n-1)) on [-1,1], the matrix cm of values -> coefficients of
     ! sum_k c_k T_(k-1), and wt(k) = int_{-1}^{1} T_(k-1)
@@ -1667,7 +2481,7 @@ CONTAINS
     ENDDO
   END SUBROUTINE cheb_antider
 
-  SUBROUTINE inner_phi_cc(k1,D,kf,nc,kcs,e,np,G,Phi,Phic)
+  SUBROUTINE inner_phi_cc(k1,D,kf,nc,kcs,e,np,G,Phi,Phic,SHORT2)
     ! Phi_q(k1,D) = int dpsi 2 f_q(k2)/k2 cos(n phi) over k2 >= k1, k2 <= kf (k2^2 = k1^2 + D^2 - 2 k1 D cos psi), and
     ! the same up to the cuts kcs(c) < kf in Phic(:,c), from one set of integrand values: rho_inner_npan uniform panels
     ! in psi of NCL Chebyshev-Lobatto points (one panel of NCS points when D < rho_inner_short k1); a panel by
@@ -1680,6 +2494,8 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(NLV,6,np),INTENT(IN)::G
     REAL(KIND(1d0)),DIMENSION(6),INTENT(OUT)::Phi
     REAL(KIND(1d0)),DIMENSION(6,nc),INTENT(OUT)::Phic
+    LOGICAL,INTENT(IN),OPTIONAL::SHORT2 ! (M11) the short rule also for k1 < rho_inner_short D; (M12) NCS points
+                                        ! per panel also elsewhere
     REAL(KIND(1d0)),DIMENSION(6,NCL,rho_inner_npan)::gv ! integrand values per panel
     REAL(KIND(1d0)),DIMENSION(6,rho_inner_npan)::Pp ! panel integrals
     REAL(KIND(1d0)),DIMENSION(NCL)::av,wq
@@ -1691,6 +2507,10 @@ CONTAINS
     IF(pb.LE.pa)RETURN
     IF(D.LT.rho_inner_short*k1)THEN
        npan=1; nn=NCS
+    ELSEIF(PRESENT(SHORT2).AND.k1.LT.rho_inner_short*D)THEN
+       npan=1; nn=NCS
+    ELSEIF(PRESENT(SHORT2))THEN ! (M12) rho_inner_npan panels of NCS points (as NCL to 3e-6 in the transforms)
+       npan=rho_inner_npan; nn=NCS
     ELSE
        npan=rho_inner_npan; nn=NCL
     ENDIF

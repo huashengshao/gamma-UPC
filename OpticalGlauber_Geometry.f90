@@ -1,7 +1,7 @@
 MODULE OpticalGlauber_Geometry
   ! This is module to provide the functions for the Optical Glauber model
   ! via the profiles. 
-  ! Besides the Optical Glauber model, another possiblity is to
+  ! Besides the Optical Glauber model, another possibility is to
   !  use the Monte Carlo Glauber model, in which the nucleons are
   ! populated stochastically according to the given nuclear density profile
   ! There are a few public Monte Carlo Glauber tools (e.g. PHOBOS in
@@ -125,7 +125,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     IF(dim_num.NE.3)THEN
        WRITE(*,*)"ERROR: Npart_avg_fxn_hardsphere is not a three dimensional function"
-       STOP
+       STOP 1
     ENDIF
     s1=DSQRT(sA(1)**2+sA(2)**2)
     IF(s1.GT.RA_common)THEN
@@ -200,7 +200,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     IF(dim_num.NE.2)THEN
        WRITE(*,*)"ERROR: Npart_fxn_hardsphere is not a two dimensional function"
-       STOP
+       STOP 1
     ENDIF
     Npart_fxn_hardsphere=0d0
     s1=DSQRT(sA(1)**2+sA(2)**2)
@@ -284,7 +284,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     IF(dim_num.NE.3)THEN
        WRITE(*,*)"ERROR: TABhat_avg_fxn_hardsphere is not a three dimensional function"
-       STOP
+       STOP 1
     ENDIF
     s1=DSQRT(sA(1)**2+sA(2)**2)
     IF(s1.GT.RA_common)THEN
@@ -400,7 +400,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     IF(dim_num.NE.2)THEN
        WRITE(*,*)"ERROR: TABhat_fxn_hardsphere is not a two dimensional function"
-       STOP
+       STOP 1
     ENDIF
     s1=DSQRT(sA(1)**2+sA(2)**2)
     IF(s1.GT.RA_common)THEN
@@ -561,7 +561,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     IF(dim_num.NE.3)THEN
        WRITE(*,*)"ERROR: Npart_avg_fxn_WoodsSaxon is not a three dimensional function"
-       STOP
+       STOP 1
     ENDIF
     ssx=sA(1)-sA(3)
     ssy=sA(2)
@@ -632,7 +632,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::pi=3.14159265358979323846264338328d0
     IF(dim_num.NE.2)THEN
        WRITE(*,*)"ERROR: Npart_fxn_WoodsSaxon is not a two dimensional function"
-       STOP
+       STOP 1
     ENDIF
     ssx=sA(1)-b_common(1)
     ssy=sA(2)-b_common(2)
@@ -716,7 +716,7 @@ CONTAINS
     REAL(KIND(1d0))::ssx,ssy
     IF(dim_num.NE.3)THEN
        WRITE(*,*)"ERROR: TABhat_avg_fxn_WoodsSaxon is not a three dimensional function"
-       STOP
+       STOP 1
     ENDIF
     ssx=sA(1)-sA(3)
     ssy=sA(2)
@@ -919,7 +919,7 @@ CONTAINS
        TAB_MC_Glauber=TAB_MC_Glauber*10d0
     ELSE
        WRITE(*,*)"Error: it is not implemented yet for A1,A2,Z1,Z2=",A(1:2),Z(1:2)
-       STOP
+       STOP 1
     ENDIF
     RETURN
   END FUNCTION TAB_MC_Glauber
@@ -1024,7 +1024,7 @@ CONTAINS
     REAL(KIND(1d0))::ssx,ssy
     IF(dim_num.NE.2)THEN
        WRITE(*,*)"ERROR: TABhat_fxn_WoodsSaxon is not a two dimensional function"
-       STOP
+       STOP 1
     ENDIF
     ssx=sA(1)-b_common(1)
     ssy=sA(2)-b_common(2)
@@ -1075,7 +1075,7 @@ CONTAINS
        TA_MC_Glauber=TA_MC_Glauber*10d0
     ELSE
        WRITE(*,*)"Error: it is not implemented yet for A=",A
-       STOP
+       STOP 1
     ENDIF
     RETURN
   END FUNCTION TA_MC_Glauber
@@ -1121,12 +1121,64 @@ CONTAINS
           IF(R_common.NE.RR.OR.w_common.NE.w.OR.aa_common.NE.aa)THEN
              ! regenerate the grid
              CLOSE(UNIT=30307)
-             INCLUDE 'generate_TAhat_WoodsSaxon_grid.inc'
+             WRITE(*,*)"INFO: generate A grid for TAhat in Woods-Saxon (may take a few seconds)"
+             IF(store_grid)OPEN(UNIT=30307,FILE=TRIM(nuclear_dir)//'grid/TAhat_WoodsSaxon.grid')
+             R_common=RR
+             w_common=w
+             aa_common=aa
+             A_common=A
+             ds=10d0*RR/NSTEPS
+             IF(store_grid)THEN
+                WRITE(30307,*)NSTEPS+1,R_common,w_common,aa_common
+             ELSE
+                NA=NSTEPS+1
+                ALLOCATE(XA(NA))
+                ALLOCATE(YA(NA))
+             ENDIF
+             DO i=0,NSTEPS
+                ss=i*ds
+                ss_common=ss
+                CALL trapezoid_integration(10000,TAhat_fxn_WoodsSaxon,50d0*RR,TAhat_WoodsSaxon)
+                TAhat_WoodsSaxon=TAhat_WoodsSaxon/A
+                IF(store_grid)THEN
+                   WRITE(30307,*)ss,TAhat_WoodsSaxon
+                ELSE
+                   XA(i+1)=ss
+                   YA(i+1)=TAhat_WoodsSaxon
+                ENDIF
+             ENDDO
+             IF(store_grid)CLOSE(UNIT=30307)
           ELSE
              CLOSE(UNIT=30307)
           ENDIF
        ELSE
-          INCLUDE 'generate_TAhat_WoodsSaxon_grid.inc'
+          WRITE(*,*)"INFO: generate A grid for TAhat in Woods-Saxon (may take a few seconds)"
+          IF(store_grid)OPEN(UNIT=30307,FILE=TRIM(nuclear_dir)//'grid/TAhat_WoodsSaxon.grid')
+          R_common=RR
+          w_common=w
+          aa_common=aa
+          A_common=A
+          ds=10d0*RR/NSTEPS
+          IF(store_grid)THEN
+             WRITE(30307,*)NSTEPS+1,R_common,w_common,aa_common
+          ELSE
+             NA=NSTEPS+1
+             ALLOCATE(XA(NA))
+             ALLOCATE(YA(NA))
+          ENDIF
+          DO i=0,NSTEPS
+             ss=i*ds
+             ss_common=ss
+             CALL trapezoid_integration(10000,TAhat_fxn_WoodsSaxon,50d0*RR,TAhat_WoodsSaxon)
+             TAhat_WoodsSaxon=TAhat_WoodsSaxon/A
+             IF(store_grid)THEN
+                WRITE(30307,*)ss,TAhat_WoodsSaxon
+             ELSE
+                XA(i+1)=ss
+                YA(i+1)=TAhat_WoodsSaxon
+             ENDIF
+          ENDDO
+          IF(store_grid)CLOSE(UNIT=30307)
        ENDIF
        IF(store_grid)THEN
           OPEN(UNIT=30307,FILE=TRIM(nuclear_dir)//'grid/TAhat_WoodsSaxon.grid')
@@ -1158,12 +1210,64 @@ CONTAINS
           IF(R_common.NE.RR.OR.w_common.NE.w.OR.aa_common.NE.aa)THEN
              ! regenerate the grid
              CLOSE(UNIT=30307)
-             INCLUDE 'generate_TBhat_WoodsSaxon_grid.inc'
+             WRITE(*,*)"INFO: generate B grid for TAhat in Woods-Saxon (may take a few seconds)"
+             IF(store_grid)OPEN(UNIT=30307,FILE=TRIM(nuclear_dir)//'grid/TBhat_WoodsSaxon.grid')
+             R_common=RR
+             w_common=w
+             aa_common=aa
+             A_common=A
+             ds=10d0*RR/NSTEPS
+             IF(store_grid)THEN
+                WRITE(30307,*)NSTEPS+1,R_common,w_common,aa_common
+             ELSE
+                NB=NSTEPS+1
+                ALLOCATE(XB(NB))
+                ALLOCATE(YB(NB))
+             ENDIF
+             DO i=0,NSTEPS
+                ss=i*ds
+                ss_common=ss
+                CALL trapezoid_integration(10000,TAhat_fxn_WoodsSaxon,50d0*RR,TAhat_WoodsSaxon)
+                TAhat_WoodsSaxon=TAhat_WoodsSaxon/A
+                IF(store_grid)THEN
+                   WRITE(30307,*)ss,TAhat_WoodsSaxon
+                ELSE
+                   XB(i+1)=ss
+                   YB(i+1)=TAhat_WoodsSaxon
+                ENDIF
+             ENDDO
+             IF(store_grid)CLOSE(UNIT=30307)
           ELSE
              CLOSE(UNIT=30307)
           ENDIF
        ELSE
-          INCLUDE 'generate_TBhat_WoodsSaxon_grid.inc'
+          WRITE(*,*)"INFO: generate B grid for TAhat in Woods-Saxon (may take a few seconds)"
+          IF(store_grid)OPEN(UNIT=30307,FILE=TRIM(nuclear_dir)//'grid/TBhat_WoodsSaxon.grid')
+          R_common=RR
+          w_common=w
+          aa_common=aa
+          A_common=A
+          ds=10d0*RR/NSTEPS
+          IF(store_grid)THEN
+             WRITE(30307,*)NSTEPS+1,R_common,w_common,aa_common
+          ELSE
+             NB=NSTEPS+1
+             ALLOCATE(XB(NB))
+             ALLOCATE(YB(NB))
+          ENDIF
+          DO i=0,NSTEPS
+             ss=i*ds
+             ss_common=ss
+             CALL trapezoid_integration(10000,TAhat_fxn_WoodsSaxon,50d0*RR,TAhat_WoodsSaxon)
+             TAhat_WoodsSaxon=TAhat_WoodsSaxon/A
+             IF(store_grid)THEN
+                WRITE(30307,*)ss,TAhat_WoodsSaxon
+             ELSE
+                XB(i+1)=ss
+                YB(i+1)=TAhat_WoodsSaxon
+             ENDIF
+          ENDDO
+          IF(store_grid)CLOSE(UNIT=30307)
        ENDIF
        IF(store_grid)THEN
           OPEN(UNIT=30307,FILE=TRIM(nuclear_dir)//'grid/TBhat_WoodsSaxon.grid')
@@ -1173,6 +1277,7 @@ CONTAINS
           DO i=1,NB
              READ(30307,*)XB(i),YB(i)
           ENDDO
+          CLOSE(UNIT=30307)
        ENDIF
        init2=1
     ENDIF
@@ -1198,7 +1303,8 @@ CONTAINS
        IF(ss.GT.10d0*RR)THEN
           TAhat_WoodsSaxon=0d0
        ELSE
-          CALL SPLINE_INTERPOLATE(XA,YA,NA,ss,TAhat_WoodsSaxon)
+          ! the B grid: beam B can be another nucleus than beam A
+          CALL SPLINE_INTERPOLATE(XB,YB,NB,ss,TAhat_WoodsSaxon)
           !CALL POLYNOMINAL_INTERPOLATE(XB,YB,NB,ss,TAhat_WoodsSaxon,error)
        ENDIF
     ENDIF
@@ -1443,7 +1549,7 @@ CONTAINS
        sigma_inelastic=28.84d0+0.0456d0*DLOG(energy**2)**(2.374d0)
     ELSE
        WRITE(*,*)"ERROR: do not know sigmaNN_inelastic_eval=",sigmaNN_inelastic_eval
-       STOP
+       STOP 1
     ENDIF
     !PRINT *, sigma_inelastic
     RETURN
@@ -1512,7 +1618,7 @@ CONTAINS
 !    CLOSE(UNIT=20565)
     IF(.NOT.found)THEN
        WRITE(*,*)"ERROR: do not find the '"//TRIM(name)//"'. Check input/nuclear_info.inp."
-       STOP
+       STOP 1
     ENDIF
     RETURN
   END SUBROUTINE GetNuclearInfo
@@ -1537,7 +1643,7 @@ CONTAINS
              IF(NC.GT.NMAX+1)THEN
                 WRITE(*,*)"ERROR: too many centrality bins (>20) to enlarge NMAX"
                 CLOSE(UNIT=230556)
-                STOP
+                STOP 1
              ENDIF
              READ(230556,*,ERR=250,END=250)cbins(NC,1),cbins(NC,2)
           ENDDO
@@ -1548,7 +1654,7 @@ CONTAINS
              IF(NB.GT.NMAX+1)THEN
                 WRITE(*,*)"ERROR: too many b bins (>20) to enlarge NMAX"
                 CLOSE(UNIT=230556)
-                STOP
+                STOP 1
              ENDIF
              READ(230556,*,ERR=251,END=251)bbins(NB,1),bbins(NB,2)
           ENDDO
@@ -1556,12 +1662,12 @@ CONTAINS
           IF(NC.LE.0)THEN
              WRITE(*,*)"ERROR: there is no centrality bin"
              CLOSE(UNIT=230556)
-             STOP
+             STOP 1
           ENDIF
           IF(NB.LE.0)THEN
              WRITE(*,*)"ERROR: there is no b bin"
              CLOSE(UNIT=230556)
-             STOP
+             STOP 1
           ENDIF
           DO i=1,NC
              READ(230556,*,ERR=252)(wmatrix(i,j),j=1,NB)
@@ -1580,7 +1686,7 @@ CONTAINS
 252    CONTINUE
        WRITE(*,*)"ERROR: unable to read the weight matrix"
        CLOSE(UNIT=230556)
-       STOP
+       STOP 1
     ENDDO
     CLOSE(UNIT=230556)
     RETURN
@@ -1642,7 +1748,7 @@ CONTAINS
     IF(ABS(sum-1d0).GT.1d-3.AND.nA_common.EQ.1d0.AND.nB_common.EQ.1d0)THEN
        WRITE(*,*)"ERROR: the sum of centrality integration over TABhat is not 1 in CalculateTAhatTBhat_WoodsSaxon_centrality"
        WRITE(*,*)"sum=",sum
-       STOP
+       STOP 1
     ENDIF
     RETURN
   END SUBROUTINE CalculateTAhatTBhat_WoodsSaxon_centrality
@@ -1661,7 +1767,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::twopi=6.28318530717958647692528676656d0
     IF(dim_num.NE.3)THEN
        WRITE(*,*)"ERROR: CalculateTAhatTBhat_WoodsSaxon_cfxn is not a three dimensional function"
-       STOP
+       STOP 1
     ENDIF
     IF(nA_common.EQ.0D0.AND.nB_common.EQ.0d0)THEN
        CalculateTAhatTBhat_WoodsSaxon_cfxn=1d0
@@ -1742,7 +1848,7 @@ CONTAINS
     IF(ABS(sum-1d0).GT.1d-3.AND.n_common.EQ.1d0)THEN
        WRITE(*,*)"ERROR: the sum of centrality integration over TABhat is not 1 in CalculateTABhat_WoodsSaxon_centrality"
        WRITE(*,*)"sum=",sum
-       STOP
+       STOP 1
     ENDIF
     RETURN
   END SUBROUTINE CalculateTABhat_WoodsSaxon_centrality
@@ -1777,7 +1883,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::twopi=6.28318530717958647692528676656d0
     IF(dim_num.NE.3)THEN
        WRITE(*,*)"ERROR: CalculateTABhat_WoodsSaxon_cfxn is not a three dimensional function"
-       STOP
+       STOP 1
     ENDIF
     IF(n_common.EQ.0D0)THEN
        CalculateTABhat_WoodsSaxon_cfxn=1d0
@@ -1829,7 +1935,7 @@ CONTAINS
     IF(ABS(sum-1d0).GT.1d-3.AND.n_common.EQ.1D0)THEN
        WRITE(*,*)"ERROR: the sum of centrality integration over TAhat is not 1 in CalculateTAhat_WoodsSaxon_centrality"
        WRITE(*,*)"sum=",sum
-       STOP
+       STOP 1
     ENDIF
     RETURN
   END SUBROUTINE CalculateTAhat_WoodsSaxon_centrality
@@ -2891,11 +2997,11 @@ CONTAINS
     SAVE log10QO4PI,init
     IF(Z.GT.ZMAX.OR.Z.LE.0)THEN
        WRITE(*,*)"ERROR: the atomic form factor is not available with Z=",Z
-       STOP
+       STOP 1
     ENDIF
     IF(q.LT.0d0)THEN
        WRITE(*,*)"ERROR: q < 0 !"
-       STOP
+       STOP 1
     ENDIF
     IF(init.EQ.0)THEN
        DO I=inq,NQ
@@ -3577,11 +3683,11 @@ CONTAINS
     REAL(KIND(1d0))::sintholam,temp
     IF(Z.GT.ZMAX.OR.Z.LE.0)THEN
        WRITE(*,*)"ERROR: the atomic form factor is not available with Z=",Z
-       STOP
+       STOP 1
     ENDIF
     IF(q.LT.0d0)THEN
        WRITE(*,*)"ERROR: q < 0 !"
-       STOP
+       STOP 1
     ENDIF
     ! GeV to angstrom^{-1}
     sintholam=q/FOURPI*1d5/0.1973d0
@@ -3855,7 +3961,7 @@ CONTAINS
        GetASymbol="Ubq    "
     CASE DEFAULT
        WRITE(*,*)"ERROR:Unknown the atomic number Z of nuclear = ",NuclearZ
-       STOP
+       STOP 1
     END SELECT
     GetASymbol2=GetASymbol
     fmt='(I5)'

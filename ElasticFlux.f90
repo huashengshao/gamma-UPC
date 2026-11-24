@@ -38,6 +38,9 @@ MODULE ElasticFlux
   PUBLIC::PhotonFlux_nucleus_EDFF_nob,PhotonFlux_nucleus_ChFF_nob
   ! proton without the small-x approximation
   PUBLIC::PhotonNumberDensity_ChargeFormFactor_proton_exact,PhotonFlux_proton_ChFF_exact_nob
+  PUBLIC::dipole_running_amplitude_row ! the running-alpha part of the small-x dipole amplitude at all b of one x
+  PUBLIC::proton_exact_density_row ! the exact density at all b of one x at once (FFE rows)
+  PUBLIC::proton_exact_kspace,proton_exact_edges,proton_exact_comb_P ! (M11) the exact density in momentum space
   PUBLIC::alpha_norm_mu ! alpha(0)/alpha(mu2) of an elastic photon at the scale mu with alpha_running4photon
   ! For generating virtualities of initial photons
   PUBLIC::generate_Q2_epa_proton_iWW,generate_Q2_epa_ion_ChFF
@@ -60,7 +63,7 @@ CONTAINS
     RETURN
   END FUNCTION PhotonNumberDensity
 
-  FUNCTION PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,CORRECTIONQ,MINUSDIPOLESQUAREQ,MU2)
+  FUNCTION PhotonNumberDensity_ChargeFormFactor_proton(b,Ega,gamma,CORRECTIONQ,MINUSDIPOLESQUAREQ,MU2,RUNAMP)
     ! It gives us the photon number density with Z=1 and alpha=1
     ! b should be written in unit of GeV-1
     ! 1 GeV^-1 = 0.1973e-15 m = 0.1973 fm
@@ -72,6 +75,7 @@ CONTAINS
     LOGICAL,INTENT(IN),OPTIONAL::MINUSDIPOLESQUAREQ ! whether we want to minus the dipole square
                                                     ! the default is no (.FALSE.)
     REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2 ! scale (GeV**2) of the photon normalisation, see alpha_norm_mu
+    REAL(KIND(1d0)),INTENT(IN),OPTIONAL::RUNAMP ! dipole_running_amplitude(b,Ega/gamma) when already known (rows)
     REAL(KIND(1d0)),PARAMETER::aa=1.1867816581938533d0 ! in unit of GeV-1 = 1/DSQRT(0.71 GeV^2)
     REAL(KIND(1d0))::btilde,atilde
     REAL(KIND(1d0))::Egaoga
@@ -110,7 +114,11 @@ CONTAINS
        integral=integral*Egaoga
     ENDIF
     ! the running of alpha (alpha_running4photon)
-    integral=integral+dipole_running_amplitude(b,Egaoga)
+    IF(PRESENT(RUNAMP))THEN
+       integral=integral+RUNAMP
+    ELSE
+       integral=integral+dipole_running_amplitude(b,Egaoga)
+    ENDIF
     dipole=0d0
     IF(PRESENT(MINUSDIPOLESQUAREQ))THEN
        IF(MINUSDIPOLESQUAREQ)THEN
@@ -149,7 +157,7 @@ CONTAINS
     REAL(KIND(1d0)),INTENT(IN),OPTIONAL::MU2
     alpha_norm_mu=1d0
     IF(.NOT.alpha_running4photon.OR..NOT.PRESENT(MU2))RETURN
-    IF(MU2.GT.0d0.AND.MU2.LT.HUGE(1d0))alpha_norm_mu=1d0/alpha_ratio_ph(MU2)
+    IF(MU2.GT.0d0.AND.MU2.LT.HUGE(1d0))alpha_norm_mu=1d0/alpha_ratio_tab(MU2) ! (alpha_ratio_ph to 2e-11)
   END FUNCTION alpha_norm_mu
 
   FUNCTION PhotonNumberDensity_ChargeFormFactor_proton_correction(b,Ega,gamma,integ_method)
@@ -190,15 +198,14 @@ CONTAINS
     INTEGER::log10xmin,log10xmin_before,ilog10x
     REAL(KIND(1d0))::XMIN=1D-8
     SAVE XMIN
-    REAL(KIND(1d0))::log10x1,kTmax
+    REAL(KIND(1d0))::log10x1
     REAL(KIND(1d0))::rescaling_bmax_save
     SAVE rescaling_bmax_save
     INTEGER,PARAMETER::n_interp=6
     REAL(KIND(1d0)),DIMENSION(n_interp)::XA2,YA2
     REAL(KIND(1d0)),PARAMETER::PIPI=3.14159265358979323846264338328d0
-    INTEGER::iter,npoints
-    REAL(KIND(1d0))::integ1,integ2,integ3,integ4
-    INTEGER,PARAMETER::itermax=8
+    INTEGER::npoints
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::colv
     REAL(KIND(1d0)),DIMENSION(1)::XI,YI,ZI
     REAL(KIND(1d0)),DIMENSION(n_interp)::XD2_1D
     REAL(KIND(1d0)),DIMENSION(nxseg+1)::YD2_1D
@@ -295,7 +302,7 @@ CONTAINS
        ENDDO
        IF(k+1.NE.NXA)THEN
           WRITE(*,*)"ERROR: mismatching k+1 and NXA in PhotonNumberDensity_ChargeFormFactor_proton_correction"
-          STOP
+          STOP 1
        ENDIF
        XA(1)=0d0
        K=0
@@ -308,62 +315,40 @@ CONTAINS
        ENDDO
        IF(K.NE.NYA-1)THEN
           WRITE(*,*)"ERROR: K != NYA-1"
-          STOP
+          STOP 1
        ENDIF
-       kTmax=DSQRT(Q2max_corr(iFFcorr)) ! match with Q2max in PND_ChargeFormFactor_proton_corr_fxn
        YA(NYA)=DBLE(log10xmin)
-       DO I=1,NXA
+       ! columns of fixed x: the k_T integrals for all b at once (corr_grid_column; was a trapezoid rule of 10000 to
+       ! 20000+ points per node)
+       ALLOCATE(colv(NXA-1))
+       DO J=1,NYA
           IF(NYA_save.EQ.0)THEN
-             IF(I.EQ.1)THEN
-                CALL progress(INT(I*50d0/NXA),50,.TRUE.)
+             IF(J.EQ.1)THEN
+                CALL progress(INT(J*50d0/NYA),50,.TRUE.)
              ELSE
-                CALL progress(INT(I*50d0/NXA),50)
+                CALL progress(INT(J*50d0/NYA),50)
              ENDIF
           ENDIF
-          IF(XA(I).EQ.0d0)THEN
-             ZA(I,J)=0d0
+          ! use the ones that have been calculated before
+          IF(NYA_save.GT.0.AND.J.LE.NYA_save)THEN
+             ZA(1:NXA,J)=ZA_save(1:NXA,J)
              CYCLE
           ENDIF
-          DO J=1,NYA
-             ! use the ones that have been calculated before
-             IF(NYA_save.GT.0.AND.J.LE.NYA_save)THEN
-                ZA(I,J)=ZA_save(I,J)
-                CYCLE
+          xga2=10d0**(YA(J)) ! x_gamma
+          Egaoga2=xga2*mproton
+          Ega2=Egaoga2*gamma
+          ! b=0 (XA(1)): the whole row vanishes
+          ZA(1,J)=0d0
+          CALL corr_grid_column(xga2,NXA-1,XA(2:NXA),colv)
+          DO I=2,NXA
+             IF(ISNAN(colv(I-1)))THEN
+                WRITE(*,*)"ERROR: the integral is not stable (b,Ega,gamma)=",XA(I),Ega2,gamma
+                STOP 1
              ENDIF
-             xga2=10d0**(YA(J)) ! x_gamma
-             Egaoga2=xga2*mproton
-             Ega2=Egaoga2*gamma
-             b_common=XA(I) ! = b
-             Egaoga_common=Egaoga2
-             npoints=10000
-             CALL trapezoid_integration(npoints,PND_ChargeFormFactor_proton_corr_fxn,&
-                  kTmax,integral)
-             ! we try to do some numerical improvement
-             integ4=0d0
-             iter=1
-             DO WHILE((iter.EQ.1.OR.&
-                  DABS(integ4/integral).GT.1.5d0.OR.DABS(integ4/integral).LT.0.67d0)&
-                  .AND.iter.LE.itermax)
-                integ4=integral
-                ! increase the points by a factor of 2
-                npoints=npoints*2
-                CALL trapezoid_integration(npoints,PND_ChargeFormFactor_proton_corr_fxn,&
-                     kTmax,integral)
-                iter=iter+1
-             END DO
-             IF(DABS(integ4/integral).GT.1.5d0.OR.DABS(integ4/integral).LT.0.67d0)THEN
-                WRITE(*,*)"WARNING: the integral is not stable (b,Ega,gamma,npoints)=",&
-                     b_common,Ega2,gamma,npoints
-                WRITE(*,*)"WARNING: integral in two iterations #1:",integ4,integral
-             ENDIF
-             IF(ISNAN(integral))THEN
-                WRITE(*,*)"ERROR: the integral is not stable (b,Ega,gamma,RA,wA,aA)=",&
-                     b_common,Ega2,gamma
-                STOP
-             ENDIF
-             ZA(I,J)=integral+corr_luxqed_dipole(XA(I),Ega2,gamma)
+             ZA(I,J)=colv(I-1)+corr_luxqed_dipole(XA(I),Ega2,gamma)
           ENDDO
        ENDDO
+       DEALLOCATE(colv)
        init=1
        iFF_grid=corr_grid_key()
     ENDIF
@@ -385,11 +370,11 @@ CONTAINS
           ENDIF
           IF(XA(k-NBSEG).GT.b)THEN
              WRITE(*,*)"Error: k is not proper #1"
-             STOP
+             STOP 1
           ENDIF
           IF(XA(k).LT.b)THEN
              WRITE(*,*)"Error: k is not proper #2"
-             STOP
+             STOP 1
           ENDIF
           DO i=k-NBSEG,k
              IF(XA(i).GE.b)EXIT
@@ -402,7 +387,7 @@ CONTAINS
              K=NXA-n_interp
           ELSE
              WRITE(*,*)"Error: you cannot reach here !"
-             STOP
+             STOP 1
           ENDIF
        ENDIF
        IF(YI(1).GE.0d0)THEN
@@ -466,7 +451,7 @@ CONTAINS
     ENDIF
     IF(ISNAN(CFF))THEN
        PRINT *, "ChargeFormFactor is NaN with ",DSQRT(Q2)
-       STOP
+       STOP 1
        CFF=0d0
     ENDIF
     IF(alpha_running4photon)CFF=CFF*alpha_ratio_ph(Q2)
@@ -703,6 +688,46 @@ CONTAINS
     RETURN
   END FUNCTION PhotonFlux_proton_ChFF_exact_nob
 
+
+  SUBROUTINE proton_exact_kspace(x,iFF,nk,kv,V)
+    ! (M11) the six k_T integrands of the exact distribution (exact_integrands) at kv(1:nk): V(6,nk)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::iFF,nk
+    REAL(KIND(1d0)),DIMENSION(nk),INTENT(IN)::kv
+    REAL(KIND(1d0)),DIMENSION(6,nk),INTENT(OUT)::V
+    INTEGER::i
+    xexact=x
+    iFFexact=iFF
+    DO i=1,nk
+       CALL exact_integrands(kv(i),6,V(:,i))
+    ENDDO
+  END SUBROUTINE proton_exact_kspace
+
+  FUNCTION proton_exact_edges(x,iFF)
+    ! (M11) the k_T of the joins of the form factors (exact_edges)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::proton_exact_edges
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::iFF
+    xexact=x
+    iFFexact=iFF
+    proton_exact_edges=exact_edges()
+  END FUNCTION proton_exact_edges
+
+  FUNCTION proton_exact_comb_P(x,P)
+    ! (M11) exact_combination with the products I(a) I(b) replaced by the pair overlaps P(a,b) (symmetric)
+    IMPLICIT NONE
+    REAL(KIND(1d0))::proton_exact_comb_P
+    REAL(KIND(1d0)),INTENT(IN)::x
+    REAL(KIND(1d0)),DIMENSION(6,6),INTENT(IN)::P
+    REAL(KIND(1d0))::mp2
+    mp2=mproton**2
+    proton_exact_comb_P=(1d0+(1d0-x)**2)/2d0*P(1,1)+(P(3,3)+P(4,4))/(8d0*mp2)&
+         +x**2/2d0*(P(3,6)+P(5,5)/2d0+P(1,5)+P(2,3)+2d0*x**2*mp2*P(2,6))&
+         +x**4*mp2/2d0*(P(2,2)+P(6,6))
+  END FUNCTION proton_exact_comb_P
+
   SUBROUTINE exact_integrands(kT,n,v)
     ! kT**nk/D*F_i(Q2) (times alpha(Q2)/alpha(0) with alpha_running4photon) for
     ! (F_i,nk) = (F1,2),(F1,1),(F2,3),(F2,3),(F2,2),(F2,1), D=kT**2+x**2*mproton**2, Q2=D/(1-x)
@@ -720,7 +745,7 @@ CONTAINS
        F2=F2-F2D
     ENDIF
     IF(alpha_running4photon)THEN
-       ar=alpha_ratio_ph(Q2)
+       ar=alpha_ratio_tab(Q2)
        F1=F1*ar
        F2=F2*ar
     ENDIF
@@ -921,28 +946,59 @@ CONTAINS
   FUNCTION dipole_running_amplitude(b,Egaoga)
     ! in the small-x approximation with alpha_running4photon, the part of the dipole amplitude
     ! int dkT kT**2/(kT**2+Egaoga**2) G_D(Q2) J1(b kT) [alpha(Q2)/alpha(0)-1], Q2=kT**2+Egaoga**2, in closed form
-    ! (as exact_dipole_amplitudes)
+    ! (as exact_dipole_amplitudes): dipole_running_amplitude_row at one b
     IMPLICIT NONE
     REAL(KIND(1d0))::dipole_running_amplitude
     REAL(KIND(1d0)),INTENT(IN)::b,Egaoga
-    REAL(KIND(1d0)),PARAMETER::Lambda2=0.71d0 ! the parameter in the dipole form factor (GeV**2)
-    REAL(KIND(1d0))::a2,e2
-    REAL(KIND(1d0)),DIMENSION(0:2)::Ka,Kq
-    REAL(KIND(1d0)),DIMENSION(3)::C
-    INTEGER::j
+    REAL(KIND(1d0)),DIMENSION(1)::A
     dipole_running_amplitude=0d0
     IF(.NOT.alpha_running4photon.OR.b.LE.0d0)RETURN
-    a2=Egaoga**2+Lambda2
-    CALL besselK012(DSQRT(a2)*b,Ka)
-    DO j=0,nrun
-       e2=Egaoga**2+srun(j)
-       CALL besselK012(DSQRT(e2)*b,Kq)
-       CALL partial_fractions((/e2/),a2,Lambda2**2,0d0,C)
-       dipole_running_amplitude=dipole_running_amplitude+crun(j)*(C(1)*exact_dipole_basis(1,e2,b,Kq,.FALSE.)&
-            +C(2)*exact_dipole_basis(1,a2,b,Ka,.FALSE.)+C(3)*exact_dipole_basis(1,a2,b,Ka,.TRUE.))
-    ENDDO
+    CALL dipole_running_amplitude_row(Egaoga,1,(/b/),A)
+    dipole_running_amplitude=A(1)
     RETURN
   END FUNCTION dipole_running_amplitude
+
+  SUBROUTINE dipole_running_amplitude_row(Egaoga,n,b,A)
+    ! dipole_running_amplitude at all b(1:n) > 0 of one Egaoga = x mp. With the poles of alpha_running_poles.inc,
+    ! sum_j crun(j) [C1(j) m_j K_1(m_j b) + C2(j) a K_1(a b) + C3(j) b K_0(a b)/2], m_j**2 = Egaoga**2+srun(j),
+    ! a**2 = Egaoga**2+0.71 (partial fractions of G_D/(y+m_j**2)): the a terms summed over j once per x; a pole term
+    ! is left out where it is below exp(-50) of the j=0 term (m_j-m_0) b > 50 (K_1(z) ~ exp(-z): < 2e-22 of it)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::Egaoga
+    INTEGER,INTENT(IN)::n
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(IN)::b
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(OUT)::A
+    REAL(KIND(1d0)),PARAMETER::Lambda2=0.71d0 ! the parameter in the dipole form factor (GeV**2)
+    REAL(KIND(1d0)),PARAMETER::ZSKIP=50d0
+    REAL(KIND(1d0))::a2,S2,S3
+    REAL(KIND(1d0)),DIMENSION(0:nrun)::e2,m,C1
+    REAL(KIND(1d0)),DIMENSION(0:2)::Ka,Kq
+    REAL(KIND(1d0)),DIMENSION(3)::C
+    INTEGER::j,k
+    A=0d0
+    IF(.NOT.alpha_running4photon)RETURN
+    a2=Egaoga**2+Lambda2
+    S2=0d0; S3=0d0
+    DO j=0,nrun
+       e2(j)=Egaoga**2+srun(j)
+       m(j)=DSQRT(e2(j))
+       CALL partial_fractions((/e2(j)/),a2,Lambda2**2,0d0,C)
+       C1(j)=crun(j)*C(1)
+       S2=S2+crun(j)*C(2)
+       S3=S3+crun(j)*C(3)
+    ENDDO
+    DO k=1,n
+       IF(b(k).LE.0d0)CYCLE
+       CALL besselK012(DSQRT(a2)*b(k),Ka)
+       A(k)=S2*exact_dipole_basis(1,a2,b(k),Ka,.FALSE.)+S3*exact_dipole_basis(1,a2,b(k),Ka,.TRUE.)
+       DO j=0,nrun
+          IF((m(j)-m(0))*b(k).GT.ZSKIP)EXIT ! m(j) increases with j
+          CALL besselK012(m(j)*b(k),Kq)
+          A(k)=A(k)+C1(j)*m(j)*Kq(1)
+       ENDDO
+    ENDDO
+    RETURN
+  END SUBROUTINE dipole_running_amplitude_row
 
   FUNCTION exact_dipole_basis(t,m2,bt,K,double)
     ! int_0^infinity dkT kT**p J_n(bt kT)/(kT**2+m2) for t=1: (n,p)=(1,2), 2: (0,1), 3: (0,3), 4: (2,3)
@@ -969,30 +1025,423 @@ CONTAINS
     RETURN
   END FUNCTION exact_dipole_basis
 
+  SUBROUTINE proton_exact_density_row(x,iFF,n,b,dens)
+    ! PhotonNumberDensity_ChargeFormFactor_proton_exact (alpha(0) normalisation) at all b(1:n) (ascending) of one x:
+    ! the closed-form dipole amplitudes (exact_dipole_amplitudes) with the partial fractions and the running-alpha
+    ! poles computed once for the row (linear in G_E, G_M: the rescaled dipole of luxqed at no cost), and the
+    ! correction beyond the dipole (iFF > 0, b <= bmaxoR R_p, k_T up to the end of the fit, exact_correction) for all b
+    ! at once on shared Gauss-Legendre nodes in k_T (panels between the joins of the form factors, width
+    ! <= min(PH/b~, 0.25 GeV) for the b of each octave of b~)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::iFF,n
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(IN)::b
+    REAL(KIND(1d0)),DIMENSION(n),INTENT(OUT)::dens
+    REAL(KIND(1d0)),PARAMETER::pi2=9.86960440108935861883449099988d0,Lambda2=0.71d0
+    REAL(KIND(1d0)),PARAMETER::bmaxoR=10d0,Rproton=0.877d0
+    REAL(KIND(1d0)),PARAMETER::PH=10d0 ! largest phase b~ k_T across a fine panel of NG Gauss-Legendre nodes
+    REAL(KIND(1d0)),PARAMETER::PC=12d0 ! largest phase across a coarse panel of NC Chebyshev points (J_n: ~1e-12)
+    REAL(KIND(1d0)),PARAMETER::HF1=0.25d0,HF2=0.05d0 ! fine panel width (GeV), dde1 / luxqed (A1 spline)
+    INTEGER,PARAMETER::NG=20,NC=24
+    REAL(KIND(1d0)),DIMENSION(4,0:nrun+1)::CU1E,CU1M,CU2E,CU2M ! partial fractions for (G_E,G_M)/G_D=(1,0),(0,1)
+    REAL(KIND(1d0)),DIMENSION(0:nrun+1)::qv,wq
+    REAL(KIND(1d0)),DIMENSION(6,n)::I,Ic
+    REAL(KIND(1d0)),DIMENSION(6)::AE,AM,v
+    REAL(KIND(1d0)),DIMENSION(0:2)::Ka,Kc,Kq
+    REAL(KIND(1d0)),DIMENSION(4,4)::L,LS
+    REAL(KIND(1d0)),DIMENSION(4,4)::SU ! (set 1E 1M 2E 2M, column 1..4) of the partial fractions summed over the poles
+    REAL(KIND(1d0)),DIMENSION(NG),SAVE::tg,wg
+    REAL(KIND(1d0)),DIMENSION(NC),SAVE::tc,wc
+    REAL(KIND(1d0)),DIMENSION(NC,NC),SAVE::TL,TR
+    REAL(KIND(1d0)),DIMENSION(:,:,:),ALLOCATABLE::GM
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::ghc
+    INTEGER,DIMENSION(:),ALLOCATABLE::glo,ghi,lmx,loff
+    INTEGER,DIMENSION(:,:),ALLOCATABLE::lv
+    INTEGER::ngr,lev
+    REAL(KIND(1d0)),DIMENSION(2)::ce
+    REAL(KIND(1d0)),DIMENSION(NC)::lw
+    REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::G2
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::cn
+    INTEGER,DIMENSION(:),ALLOCATABLE::pan
+    REAL(KIND(1d0))::hf,hc,ca,cb,u
+    INTEGER::ncp
+    LOGICAL,SAVE::glinit=.FALSE.
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::e,kn,wk
+    REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::g
+    REAL(KIND(1d0))::s,w2,a2,c2,P,Q4,bt,rE,rM,kmax,bcut,bthi,h,J0,J1,J2,xs
+    INTEGER::nq,j,iq,t,jlo,jhi,ip,m,ne,nk,ig,k,isave
+    dens=0d0
+    ! 1-x < 1e-14: the density underflows to 0 (exactly 0 in double precision for 1-x <= 1e-12, fixed and running
+    ! alpha); below 3.4e-16 the running-alpha pole sums gave NaN (the end point x = 1 of the luminosity integrals)
+    IF(x.GE.1d0-1d-14.OR.x.LE.0d0)RETURN
+    xs=xexact; isave=iFFexact
+    xexact=x
+    s=1d0-x
+    w2=(x*mproton)**2
+    a2=w2+s*Lambda2
+    c2=w2+4d0*s*mproton**2
+    P=(s*Lambda2)**2
+    Q4=4d0*s*mproton**2
+    ! the 1/(y+q) terms: q = w2 (weight 1) and, with running alpha, w2+(1-x) srun(j) (weights crun(j))
+    nq=0; qv(0)=w2; wq(0)=1d0
+    IF(alpha_running4photon)THEN
+       DO j=0,nrun
+          nq=nq+1; qv(nq)=w2+s*srun(j); wq(nq)=crun(j)
+       ENDDO
+    ENDIF
+    DO iq=0,nq
+       CALL partial_fractions((/c2,qv(iq)/),a2,P*Q4,0d0,CU1E(:,iq))
+       CALL partial_fractions((/c2,qv(iq)/),a2,P*w2,P,CU1M(:,iq))
+       CALL partial_fractions((/c2,qv(iq)/),a2,-P*Q4,0d0,CU2E(:,iq))
+       CALL partial_fractions((/c2,qv(iq)/),a2,P*Q4,0d0,CU2M(:,iq))
+    ENDDO
+    rE=0d0; rM=0d0
+    IF(iFF.EQ.2)THEN
+       rE=A1_end_ratio(1)-1d0; rM=mupomuN*(A1_end_ratio(2)-1d0)
+    ENDIF
+    bcut=bmaxoR*Rproton/GeVm12fm
+    ! the terms in 1/(y+c2), 1/(y+a2), 1/(y+a2)**2 summed over the poles q once per row (SU), so that per b only the
+    ! 1/(y+q) terms are summed; a pole term is left out where it is below exp(-50) of the q = w2 term
+    ! ((sqrt(q)-sqrt(w2)) b~ > 50, as dipole_running_amplitude_row)
+    SU(1,:)=MATMUL(CU1E(:,0:nq),wq(0:nq)); SU(2,:)=MATMUL(CU1M(:,0:nq),wq(0:nq))
+    SU(3,:)=MATMUL(CU2E(:,0:nq),wq(0:nq)); SU(4,:)=MATMUL(CU2M(:,0:nq),wq(0:nq))
+    I=0d0
+    DO j=1,n
+       bt=b(j)/s
+       IF(bt.LE.0d0)CYCLE
+       CALL besselK012(DSQRT(a2)*bt,Ka)
+       CALL besselK012(DSQRT(c2)*bt,Kc)
+       ! L(t,1..4): the integrals of type t with 1/(y+c2), 1/(y+q), 1/(y+a2), 1/(y+a2)**2; column 2 per pole
+       DO t=1,4
+          L(t,1)=exact_dipole_basis(t,c2,bt,Kc,.FALSE.)
+          L(t,3)=exact_dipole_basis(t,a2,bt,Ka,.FALSE.)
+          L(t,4)=exact_dipole_basis(t,a2,bt,Ka,.TRUE.)
+       ENDDO
+       ! (type t, set u) of the six amplitudes: E (u=1 for 1-2, 3 for 3-6), M (u=2, 4)
+       DO t=1,4
+          DO k=1,4
+             LS(t,k)=SU(k,1)*L(t,1)+SU(k,3)*L(t,3)+SU(k,4)*L(t,4)
+          ENDDO
+       ENDDO
+       DO iq=0,nq
+          IF((DSQRT(qv(iq))-DSQRT(qv(0)))*bt.GT.50d0)CYCLE
+          CALL besselK012(DSQRT(qv(iq))*bt,Kq)
+          DO t=1,4
+             u=wq(iq)*exact_dipole_basis(t,qv(iq),bt,Kq,.FALSE.)
+             LS(t,1)=LS(t,1)+CU1E(2,iq)*u; LS(t,2)=LS(t,2)+CU1M(2,iq)*u
+             LS(t,3)=LS(t,3)+CU2E(2,iq)*u; LS(t,4)=LS(t,4)+CU2M(2,iq)*u
+          ENDDO
+       ENDDO
+       AE=(/LS(1,1),LS(2,1),LS(3,3),LS(4,3),LS(1,3),LS(2,3)/)
+       AM=(/LS(1,2),LS(2,2),LS(3,4),LS(4,4),LS(1,4),LS(2,4)/)
+       I(:,j)=AE+mupomuN*AM
+       IF(iFF.EQ.2.AND.b(j).LE.bcut)I(:,j)=I(:,j)+rE*AE+rM*AM
+    ENDDO
+    ! the correction beyond the dipole: the integrand on fine Gauss-Legendre nodes of the row (panels between the
+    ! joins of the form factors, width <= HF: the structure of the fits, and <= PH/b~max), then for each octave of b~
+    ! projected on the NC Chebyshev points of coarse panels (phase b~ k_T <= PC across a panel: J_n interpolated to
+    ! ~1e-11), so that each b costs NC Bessel evaluations per coarse panel; directly on the fine nodes where the coarse
+    ! panels would be narrower than the fine ones
+    Ic=0d0
+    kmax=0d0
+    IF(iFF.NE.0)kmax=DSQRT(MAX(Q2max_corr(iFF)*s-w2,0d0))
+    IF(kmax.GT.0d0.AND.b(1).LE.bcut)THEN
+       IF(.NOT.glinit)THEN
+          CALL gauss_legendre(NG,tg,wg)
+          DO m=1,NC
+             tc(m)=-DCOS(3.14159265358979323846264338328d0*(m-1)/(NC-1))
+          ENDDO
+          DO m=1,NC
+             wc(m)=1d0
+             DO t=1,NC
+                IF(t.NE.m)wc(m)=wc(m)/(tc(m)-tc(t))
+             ENDDO
+          ENDDO
+          ! TL(m',m), TR(m',m): parent Lagrange basis m at the point m' of the left / right child
+          DO t=1,NC
+             DO k=1,2
+                u=(tc(t)+MERGE(-1d0,1d0,k.EQ.1))/2d0
+                IF(ANY(ABS(u-tc).LT.1d-14))THEN
+                   lw=0d0; lw(MINLOC(ABS(u-tc),1))=1d0
+                ELSE
+                   lw=wc/(u-tc); lw=lw/SUM(lw)
+                ENDIF
+                IF(k.EQ.1)THEN
+                   TL(t,:)=lw
+                ELSE
+                   TR(t,:)=lw
+                ENDIF
+             ENDDO
+          ENDDO
+          glinit=.TRUE.
+       ENDIF
+       iFFexact=-iFF
+       e=exact_edges()
+       e=(/0d0,PACK(e,e.LT.kmax),kmax/)
+       ne=SIZE(e)
+       jhi=COUNT(b.LE.bcut)
+       hf=MIN(MERGE(HF2,HF1,iFF.EQ.2),PH/MAX(b(jhi)/s,1d-300))
+       nk=0
+       DO ip=1,ne-1
+          nk=nk+NG*MAX(1,CEILING((e(ip+1)-e(ip))/hf))
+       ENDDO
+       ALLOCATE(kn(nk),wk(nk),g(6,nk),pan(nk))
+       k=0
+       DO ip=1,ne-1
+          m=MAX(1,CEILING((e(ip+1)-e(ip))/hf))
+          h=(e(ip+1)-e(ip))/m
+          DO t=1,m
+             DO ig=1,NG
+                k=k+1
+                kn(k)=e(ip)+h*(t-0.5d0+0.5d0*tg(ig))
+                wk(k)=0.5d0*h*wg(ig)
+                pan(k)=ip
+             ENDDO
+          ENDDO
+       ENDDO
+       DO k=1,nk
+          CALL exact_integrands(kn(k),6,v)
+          g(:,k)=wk(k)*v
+       ENDDO
+       ! groups of b: octaves of b~ (b <= bcut), each with coarse panels of width <= hc = PC/b~max
+       ALLOCATE(glo(n),ghi(n),ghc(n))
+       ngr=0
+       jhi=0
+       DO WHILE(jhi.LT.n)
+          jlo=jhi+1
+          IF(b(jlo).GT.bcut)EXIT
+          bthi=2d0*b(jlo)/s
+          jhi=jlo
+          DO WHILE(jhi.LT.n)
+             IF(b(jhi+1)/s.GT.bthi.OR.b(jhi+1).GT.bcut)EXIT
+             jhi=jhi+1
+          ENDDO
+          ngr=ngr+1
+          glo(ngr)=jlo; ghi(ngr)=jhi; ghc(ngr)=PC/(b(jhi)/s)
+       ENDDO
+       ! nested coarse panels: 2**l equal panels of [0,kmax] at level l (they interpolate J_n(b~ k), smooth across the
+       ! joins of the form factors, which only the fine nodes need); a group uses the coarsest level with width <= hc.
+       ! The moments of the fine integrand on the Chebyshev points are computed at the finest level (barycentric
+       ! weights at the fine nodes) and passed to the coarser levels with the values of the parent Lagrange basis at
+       ! the children's points (exact: the parent basis is a polynomial of degree NC-1 on each child)
+       ce=(/0d0,kmax/)
+       ALLOCATE(lv(1,ngr),lmx(1),loff(1))
+       lmx=-1
+       DO ig=1,ngr
+          DO ip=1,1
+             lv(ip,ig)=-1
+             IF(ghc(ig).LE.2d0*hf)CYCLE
+             lv(ip,ig)=MAX(0,CEILING(DLOG((ce(ip+1)-ce(ip))/ghc(ig))/DLOG(2d0)-1d-12))
+             lmx(ip)=MAX(lmx(ip),lv(ip,ig))
+          ENDDO
+       ENDDO
+       ncp=0
+       DO ip=1,1
+          loff(ip)=ncp
+          IF(lmx(ip).GE.0)ncp=ncp+2**(lmx(ip)+1)-1
+       ENDDO
+       ! panel q (0-based) of level lev of interval ip: column loff(ip)+2**lev-1+q+1 of GM
+       ALLOCATE(GM(6,NC,MAX(ncp,1)))
+       GM=0d0
+       DO k=1,nk
+          ip=1
+          IF(lmx(ip).LT.0)CYCLE
+          m=2**lmx(ip)
+          h=(ce(ip+1)-ce(ip))/m
+          t=MIN(MAX(INT((kn(k)-ce(ip))/h),0),m-1)
+          ca=ce(ip)+t*h
+          u=2d0*(kn(k)-ca)/h-1d0
+          lw=wc/(u-tc)
+          IF(ANY(ABS(u-tc).LT.1d-14))THEN
+             lw=0d0; lw(MINLOC(ABS(u-tc),1))=1d0
+          ELSE
+             lw=lw/SUM(lw)
+          ENDIF
+          iq=loff(ip)+m-1+t+1
+          DO ig=1,NC
+             GM(:,ig,iq)=GM(:,ig,iq)+g(:,k)*lw(ig)
+          ENDDO
+       ENDDO
+       DO ip=1,1
+          DO lev=lmx(ip)-1,0,-1
+             DO t=0,2**lev-1
+                iq=loff(ip)+2**lev-1+t+1
+                k=loff(ip)+2**(lev+1)-1+2*t+1
+                GM(:,:,iq)=MATMUL(GM(:,:,k),TL)+MATMUL(GM(:,:,k+1),TR)
+             ENDDO
+          ENDDO
+       ENDDO
+       DO ig=1,ngr
+          jlo=glo(ig); jhi=ghi(ig)
+          IF(ghc(ig).LE.2d0*hf)THEN
+             ! direct sums on the fine nodes
+             DO j=jlo,jhi
+                bt=b(j)/s
+                v=0d0
+                DO k=1,nk
+                   CALL bj012(bt*kn(k),J0,J1,J2)
+                   v=v+g(:,k)*(/J1,J0,J0,J2,J1,J0/)
+                ENDDO
+                Ic(:,j)=v
+             ENDDO
+          ELSE
+             ! the Chebyshev points of the group's level and their moments
+             m=0
+             DO ip=1,1
+                m=m+NC*2**lv(ip,ig)
+             ENDDO
+             IF(ALLOCATED(G2))DEALLOCATE(G2,cn)
+             ALLOCATE(G2(6,m),cn(m))
+             m=0
+             DO ip=1,1
+                lev=lv(ip,ig)
+                h=(ce(ip+1)-ce(ip))/2**lev
+                DO t=0,2**lev-1
+                   iq=loff(ip)+2**lev-1+t+1
+                   DO k=1,NC
+                      m=m+1
+                      cn(m)=ce(ip)+(t+0.5d0)*h+0.5d0*h*tc(k)
+                      G2(:,m)=GM(:,k,iq)
+                   ENDDO
+                ENDDO
+             ENDDO
+             DO j=jlo,jhi
+                bt=b(j)/s
+                v=0d0
+                DO k=1,m
+                   CALL bj012(bt*cn(k),J0,J1,J2)
+                   v=v+G2(:,k)*(/J1,J0,J0,J2,J1,J0/)
+                ENDDO
+                Ic(:,j)=v
+             ENDDO
+          ENDIF
+       ENDDO
+    ENDIF
+    DO j=1,n
+       IF(b(j).LE.0d0)CYCLE
+       dens(j)=exact_combination(I(:,j)+Ic(:,j))/pi2/s**2
+    ENDDO
+    xexact=xs; iFFexact=isave
+  CONTAINS
+    SUBROUTINE bj012(z,j0,j1,j2) ! J_0, J_1, J_2 at z >= 0
+      REAL(KIND(1d0)),INTENT(IN)::z
+      REAL(KIND(1d0)),INTENT(OUT)::j0,j1,j2
+      j0=BESSEL_J0(z); j1=BESSEL_J1(z)
+      IF(z.GT.1d-4)THEN
+         j2=2d0*j1/z-j0
+      ELSE
+         j2=z*z/8d0*(1d0-z*z/12d0)
+      ENDIF
+    END SUBROUTINE bj012
+  END SUBROUTINE proton_exact_density_row
+
+  SUBROUTINE gauss_legendre(nn,tt,ww)
+    ! Gauss-Legendre nodes and weights on [-1,1] (Newton on P_nn)
+    IMPLICIT NONE
+    INTEGER,INTENT(IN)::nn
+    REAL(KIND(1d0)),DIMENSION(nn),INTENT(OUT)::tt,ww
+    REAL(KIND(1d0))::zz,p1,p2,p3,pp
+    INTEGER::ii,jj,it
+    DO ii=1,nn
+       zz=DCOS(3.14159265358979323846264338328d0*(ii-0.25d0)/(nn+0.5d0))
+       DO it=1,100
+          p1=1d0; p2=0d0
+          DO jj=1,nn
+             p3=p2; p2=p1; p1=((2d0*jj-1d0)*zz*p2-(jj-1d0)*p3)/jj
+          ENDDO
+          pp=nn*(zz*p1-p2)/(zz*zz-1d0)
+          zz=zz-p1/pp
+          IF(ABS(p1/pp).LT.1d-16)EXIT
+       ENDDO
+       p1=1d0; p2=0d0
+       DO jj=1,nn
+          p3=p2; p2=p1; p1=((2d0*jj-1d0)*zz*p2-(jj-1d0)*p3)/jj
+       ENDDO
+       pp=nn*(zz*p1-p2)/(zz*zz-1d0)
+       tt(ii)=-zz; ww(ii)=2d0/((1d0-zz*zz)*pp*pp)
+    ENDDO
+  END SUBROUTINE gauss_legendre
+
+  SUBROUTINE corr_grid_column(xga,nb,bv,col)
+    ! the k_T integral of PND_ChargeFormFactor_proton_corr_fxn (form factor iFFcorr, running alpha as set) at all
+    ! b of bv(1:nb) for one x_gamma: composite Gauss-Legendre rule (NG nodes per panel) on panels between the joins of
+    ! the form factor (dde1: ratio_dde1; luxqed: knots of the A1 table) of width <= HF (the structure of the fits) and
+    ! <= PH/max(b) (phase of J_1 across a panel); the Bessel functions on the shared nodes for all b at once
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::xga
+    INTEGER,INTENT(IN)::nb
+    REAL(KIND(1d0)),DIMENSION(nb),INTENT(IN)::bv
+    REAL(KIND(1d0)),DIMENSION(nb),INTENT(OUT)::col
+    REAL(KIND(1d0)),PARAMETER::PH=10d0,HF1=0.25d0,HF2=0.05d0
+    INTEGER,PARAMETER::NG=20
+    REAL(KIND(1d0)),DIMENSION(4),PARAMETER::Q2dde1=(/1.02d0,1.22d0,2.5d0,3.5d0/)
+    REAL(KIND(1d0)),DIMENSION(7),PARAMETER::Q2A1=(/0.25d0,0.5d0,0.75d0,1d0,1.5d0,3d0,9.995d0/)
+    REAL(KIND(1d0)),DIMENSION(NG),SAVE::tg,wg
+    LOGICAL,SAVE::glinit=.FALSE.
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::q2e,e
+    REAL(KIND(1d0)),DIMENSION(31)::eg
+    REAL(KIND(1d0))::e2,kmax,hf,h,k,Q2,f,dipole,CFF,ek
+    REAL(KIND(1d0)),PARAMETER::aa=1.1867816581938533d0 ! 1/DSQRT(0.71 GeV^2), as PND_ChargeFormFactor_proton_corr_fxn
+    REAL(KIND(1d0))::rE
+    INTEGER::ip,m,t,ig,ne
+    col=0d0
+    e2=(xga*mproton)**2
+    IF(e2.GE.Q2max_corr(iFFcorr).OR.nb.LE.0)RETURN
+    kmax=DSQRT(Q2max_corr(iFFcorr)-e2)
+    IF(.NOT.glinit)THEN
+       CALL gauss_legendre(NG,tg,wg)
+       glinit=.TRUE.
+    ENDIF
+    IF(iFFcorr.EQ.2)THEN
+       q2e=Q2A1
+    ELSE
+       q2e=Q2dde1
+    ENDIF
+    q2e=q2e-e2
+    rE=A1_end_ratio(1)
+    e=DSQRT(PACK(q2e,q2e.GT.0d0))
+    ! k_T**2/(k_T**2+x**2 mp**2) varies on the scale x mp: edges at x mp 4**m below the first join (and the first A1 knot)
+    ek=MIN(MINVAL(e),MERGE(DSQRT(MAX(0.005d0-e2,0d0)),1d300,iFFcorr.EQ.2))
+    eg=(/(DSQRT(e2)*4d0**m,m=0,30)/)
+    e=(/0d0,PACK(eg,eg.LT.MIN(ek,kmax)),PACK(e,e.LT.kmax),kmax/)
+    ne=SIZE(e)
+    hf=MIN(MERGE(HF2,HF1,iFFcorr.EQ.2),PH/MAX(MAXVAL(bv),1d-300))
+    DO ip=1,ne-1
+       m=MAX(1,CEILING((e(ip+1)-e(ip))/hf))
+       h=(e(ip+1)-e(ip))/m
+       DO t=1,m
+          DO ig=1,NG
+             k=e(ip)+h*(t-0.5d0+0.5d0*tg(ig))
+             Q2=k*k+e2
+             dipole=1d0/(1d0+Q2*aa**2)**2
+             IF(iFFcorr.EQ.2)THEN
+                CFF=formfactor_A1(Q2,1)-rE*dipole
+             ELSE
+                CFF=dipole*(ratio_dde1(Q2)-1d0)
+             ENDIF
+             IF(alpha_running4photon)CFF=CFF*alpha_ratio_tab(Q2)
+             f=0.5d0*h*wg(ig)*k*k/Q2*CFF
+             col=col+f*BESSEL_J1(bv*k)
+          ENDDO
+       ENDDO
+    ENDDO
+    RETURN
+  END SUBROUTINE corr_grid_column
+
   SUBROUTINE besselK012(z,K)
-    ! modified Bessel functions K_0, K_1, K_2 at z > 0 to double precision, from
-    ! K_n(z) = int_0^infinity dt exp(-z cosh t) cosh(n t) by the trapezoid rule (exponentially convergent)
+    ! modified Bessel functions K_0, K_1, K_2 at z > 0 to double precision: the Chebyshev expansions of tbessk.f90
+    ! (exp-scaled, ~1e-15), K_2 = K_0 + 2 K_1/z; zero above z = 700 (as before)
     IMPLICIT NONE
     REAL(KIND(1d0)),INTENT(IN)::z
     REAL(KIND(1d0)),DIMENSION(0:2),INTENT(OUT)::K
-    REAL(KIND(1d0))::h,f,eh,et,ch,ch1
+    REAL(KIND(1d0)),EXTERNAL::GUPC_BESSK0E,GUPC_BESSK1E
+    REAL(KIND(1d0))::ez
     K=0d0
     IF(z.GT.7d2)RETURN
-    h=MIN(0.1d0,0.5d0/DSQRT(z))
-    eh=EXP(h)
-    et=1d0
-    ch1=2d0*SINH(h/2d0)**2 ! cosh(h)-1
-    K=0.5d0
-    DO
-       et=et*eh ! exp(t), t=j*h
-       ch=(et+1d0/et)/2d0
-       IF(et.LT.2d0)ch1=2d0*SINH(DLOG(et)/2d0)**2 ! cosh(t)-1 without cancellation at small t
-       IF(et.GE.2d0)ch1=ch-1d0
-       f=EXP(-z*ch1) ! exp(-z (cosh t - 1))
-       K=K+f*(/1d0,ch,2d0*ch**2-1d0/)
-       IF(f*(2d0*ch**2-1d0).LT.1d-17*K(2))EXIT
-    ENDDO
-    K=h*EXP(-z)*K
+    ez=DEXP(-z)
+    K(0)=GUPC_BESSK0E(z)*ez
+    K(1)=GUPC_BESSK1E(z)*ez
+    K(2)=K(0)+2d0*K(1)/z
     RETURN
   END SUBROUTINE besselK012
 
@@ -1057,7 +1506,7 @@ CONTAINS
     REAL(KIND(1d0)),DIMENSION(n_interp,nxseg+1)::ZD2
     IF(ibeam.GT.2.OR.ibeam.LT.1)THEN
        WRITE(*,*)"Error: ibeam=/=1,2 in PhotonNumberDensity_ChargeFormFactor_WS"
-       STOP
+       STOP 1
     ENDIF
     Egaoga=Ega/gamma ! gamma=Ebeam/mN, xga=Ega/Ebeam, Egaoga=xga*mN
     xga=Egaoga/mN
@@ -1189,7 +1638,7 @@ CONTAINS
           ENDDO
           IF(k+1.NE.NXA)THEN
              WRITE(*,*)"ERROR: mismatching k+1 and NXA in PhotonNumberDensity_ChargeFormFactor_WS"
-             STOP
+             STOP 1
           ENDIF
           XA(ibeam,1)=0d0
           K=0
@@ -1202,7 +1651,7 @@ CONTAINS
           ENDDO
           IF(K.NE.NYA-1)THEN
              WRITE(*,*)"ERROR: K != NYA-1"
-             STOP
+             STOP 1
           ENDIF
           YA(ibeam,NYA)=DBLE(log10xmin)
           DO I=1,NXA
@@ -1212,7 +1661,8 @@ CONTAINS
                 CALL progress(INT(I*50d0/NXA),50)
              ENDIF
              IF(XA(ibeam,I).EQ.0d0)THEN
-                ZA(ibeam,I,J)=0d0
+                ! b=0: the whole row vanishes (J is not the x index here)
+                ZA(ibeam,I,1:NYA)=0d0
                 CYCLE
              ENDIF
              DO J=1,NYA
@@ -1331,7 +1781,7 @@ CONTAINS
                    IF(ISNAN(integral))THEN
                       WRITE(*,*)"ERROR: the integral is not stable (b,Ega,gamma,RA,wA,aA)=",&
                            b_common/Egaoga2,Ega2,gamma,RR,w,aa
-                      STOP
+                      STOP 1
                    ENDIF
                    ZA(ibeam,I,J)=integral
                 ENDIF
@@ -1345,7 +1795,7 @@ CONTAINS
        WRITE(*,*)"INFO: ibeam=",ibeam
        WRITE(*,*)"INFO: Saved ones (RA,wA,aA)=",R_save(ibeam),w_save(ibeam),aa_save(ibeam)
        WRITE(*,*)"INFO: New ones (RA,wA,aA)=",RR,w,aa
-       STOP
+       STOP 1
     ENDIF
     IF(b.GT.rescaling_bmax_save(ibeam).OR.b.LE.0d0)THEN
        IF(bcut.LE.0d0.OR.b.LE.0d0)THEN
@@ -1377,11 +1827,11 @@ CONTAINS
           ENDIF
           IF(XA(ibeam,k-NBSEG).GT.b)THEN
              WRITE(*,*)"Error: k is not proper #1"
-             STOP
+             STOP 1
           ENDIF
           IF(XA(ibeam,k).LT.b)THEN
              WRITE(*,*)"Error: k is not proper #2"
-             STOP
+             STOP 1
           ENDIF
           DO i=k-NBSEG,k
              IF(XA(ibeam,i).GE.b)EXIT
@@ -1406,7 +1856,7 @@ CONTAINS
              !ENDDO
           ELSE
              WRITE(*,*)"Error: you cannot reach here !"
-             STOP
+             STOP 1
           ENDIF
           !CALL SPLINE_INTERPOLATE(XA2,YA2,n_interp,bb,integral)
        ENDIF
@@ -1470,7 +1920,7 @@ CONTAINS
     CFF=ChargeFormFactor_WoodsSaxon(Q,R_common,w_common,aa_common,0)
     IF(ISNAN(CFF))THEN
        PRINT *, "ChargeFormFactor is NaN with ",Q, R_common, w_common, aa_common
-       STOP
+       STOP 1
        CFF=0d0
     ENDIF
     !IF(bkT.LE.5d2)THEN
@@ -1618,7 +2068,7 @@ CONTAINS
     CFF=ChargeFormFactor_WoodsSaxon(Qtil,Rtil,w_common,atil,0)
     IF(ISNAN(CFF))THEN
        PRINT *, "ChargeFormFactor is NaN with ",Qtil, Rtil, w_common, atil
-       STOP
+       STOP 1
        CFF=0d0
     ENDIF
     PND_ChargeFormFactor_WS_fxn2=BESSJ1(bkT)*CFF*kTtil**2/Qtil**2
@@ -1841,7 +2291,7 @@ CONTAINS
        ENDDO
        IF(K.NE.MX)THEN
           WRITE(*,*)"ERROR: K != MX"
-          STOP
+          STOP 1
        ENDIF
        XD_1D(MX+1)=DBLE(log10xmin)
        bupper=bmaxoR*Rproton/GeVm12fm ! the hard cut in the grid of PhotonNumberDensity_ChargeFormFactor_proton_correction 
@@ -1984,7 +2434,7 @@ CONTAINS
     SAVE XA,ZA,ZA1_save,ZA2_save
     IF(ibeam.GT.2.OR.ibeam.LT.1)THEN
        WRITE(*,*)"Error: ibeam=/=1,2 in PhotonFlux_nucleus_ChFF_nob"
-       STOP
+       STOP 1
     ENDIF
     IF(x.LT.1d-99)THEN
        PhotonFlux_nucleus_ChFF_nob=0d0
@@ -2077,7 +2527,7 @@ CONTAINS
           ENDDO
           IF(K.NE.NXA-1)THEN
              WRITE(*,*)"ERROR: K != NXA-1"
-             STOP
+             STOP 1
           ENDIF
           XA(ibeam,NXA)=DBLE(log10xmin)
           DO I=1,NXA
@@ -2115,7 +2565,7 @@ CONTAINS
        WRITE(*,*)"INFO: ibeam=",ibeam
        WRITE(*,*)"INFO: Saved ones (gamma,RA,wA,aA)=",gamma_save(ibeam),R_save(ibeam),w_save(ibeam),aa_save(ibeam)
        WRITE(*,*)"INFO: New ones (gamma,RA,wA,aA)=",gamma,RA,wA,aA
-       STOP
+       STOP 1
     ENDIF
     XI(1)=DLOG10(x)
     N=-FLOOR(XI(1))-1 ! x is from 10**(-n-1) to 10**(-n)
@@ -2129,11 +2579,11 @@ CONTAINS
        ENDIF
        IF(XA(ibeam,k+NXSEG).GT.XI(1))THEN
           WRITE(*,*)"Error: k is not proper #1"
-          STOP
+          STOP 1
        ENDIF
        IF(XA(ibeam,k).LT.XI(1))THEN
           WRITE(*,*)"Error: k is not proper #2"
-          STOP
+          STOP 1
        ENDIF
        DO i=k,k+NXSEG
           IF(XA(ibeam,i).LE.XI(1))EXIT
@@ -2146,7 +2596,7 @@ CONTAINS
           K=NXA-n_interp
        ELSE
           WRITE(*,*)"Error: you cannot reach here !"
-          STOP
+          STOP 1
        ENDIF
     ENDIF
     ! it turns out to be important with spline
@@ -2244,7 +2694,7 @@ CONTAINS
     integer::i,j
     if(x.ge.1d0.or.x.le.0d0)then
        write(*,*)"ERROR: x>=1 or x<=0"
-       stop
+       stop 1
     endif
     mp2=mp**2
     Q2min=mp2*x**2/(1d0-x)
@@ -2327,15 +2777,15 @@ CONTAINS
     integer::i,j
     if(ion_Form.ne.1.and.ion_Form.ne.2)then
        write(*,*)"ERROR: ion_Form =/= 1 or 2"
-       stop
+       stop 1
     endif
     if(ibeam.ne.1.and.ibeam.ne.2)then
        write(*,*)"ERROR: ibeam =/= 1 or 2"
-       stop
+       stop 1
     endif
     if(x.ge.1d0.or.x.le.0d0)then
        write(*,*)"ERROR: x>=1 or x<=0"
-       stop
+       stop 1
     endif
     mn2=mn**2
     if(ion_Form.eq.2)then

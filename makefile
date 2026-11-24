@@ -1,16 +1,24 @@
-
+# gammaUPC library.
+# In MadGraph (default): FC, FFLAGS, libext and CREATELIB from ../../make_opts, the library in ../../../lib/,
+# with the MadGraph entry photonpdfsquare (v2.0).
+# Standalone (drivers, tests): make STANDALONE=1: gfortran, -O2 unless FFLAGS is set, the library here, no
+# photonpdfsquare (it needs MadGraph's pdf.inc).
+ifeq ($(STANDALONE),1)
 libext=a
 define CREATELIB
 $(AR) cru $(1) $(2)
 ranlib $(1)
 endef
-
-LIBRARY       = libgammaUPC.$(libext)
-LIBDIR        = ./
-
 FC=gfortran
-# default optimisation; FFLAGS set in the environment or on the command line (e.g. by MadGraph) takes precedence
 FFLAGS?=-O2
+LIBDIR=./
+MGOBJ=
+else
+LIBDIR=../../../lib/
+include ../../make_opts
+MGOBJ=photonpdfsquare.o
+endif
+LIBRARY=libgammaUPC.$(libext)
 
 EXE=test
 
@@ -23,13 +31,13 @@ LHAPDFOBJ=lhapdf_stub.o
 LHAPDFLIBS=
 endif
 
-# optional, never the default: make OPENMP=1 computes the rows of the inelastic photon (Inelastic_fast_building) in
-# parallel (programs then link with -fopenmp); without it the code is serial (the OpenMP directives are comments)
+# optional, never the default: make OPENMP=1 computes the rows of the inelastic photon in parallel (programs then
+# link with -fopenmp); without it the code is serial (the OpenMP directives are comments)
 ifeq ($(OPENMP),1)
 override FFLAGS+=-fopenmp
 endif
 
-photonflux=tbessk.o tbessj.o elliptic_integral.o nielsen_generalized_polylog.o photoabsorption.o bessel_integration.o alpha_running.o ElasticFlux.o PhotonPhotonFlux.o ElasticPhotonPhotonFlux.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o structure_functions.o InelasticFlux.o $(LHAPDFOBJ)
+photonflux=tbessk.o tbessj.o elliptic_integral.o nielsen_generalized_polylog.o photoabsorption.o bessel_integration.o alpha_running.o ElasticFlux.o PhotonPhotonFlux.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o structure_functions.o InelasticFlux.o $(LHAPDFOBJ) $(MGOBJ)
 
 all: $(LIBDIR)$(LIBRARY)
 
@@ -39,34 +47,38 @@ $(LIBDIR)$(LIBRARY): $(photonflux)
 $(EXE): test.o $(photonflux)
 	$(FC) $(FFLAGS) -o $(EXE) test.o $(photonflux) $(LHAPDFLIBS)
 
-test.o: test.f90 ElasticPhotonPhotonFlux.mod OpticalGlauber_Geometry.mod
+# Each module is a prerequisite through its .o: one 'gfortran -c X.f90' writes both X.o and x.mod. A rule
+# 'X.o X.mod: X.f90' declares two independent targets, so 'make -j' ran that compilation twice at the same time and
+# the two collided on x.mod. gfortran also lowercases the .mod name, which a case-sensitive file system never
+# matches to X.mod. (v2.0)
+test.o: test.f90 PhotonPhotonFlux.o OpticalGlauber_Geometry.o
 	$(FC) $(FFLAGS) -c $<
 
-ElasticPhotonPhotonFlux.o ElasticPhotonPhotonFlux.mod: ElasticPhotonPhotonFlux.f90 PhotonPhotonFlux.mod
+PhotonPhotonFlux.o: PhotonPhotonFlux.f90 ElasticFlux.o InelasticFlux.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o photoabsorption.o
 	$(FC) $(FFLAGS) -c $<
 
-PhotonPhotonFlux.o PhotonPhotonFlux.mod: PhotonPhotonFlux.f90 ElasticFlux.mod inelasticflux.mod OpticalGlauber_Geometry.mod nintlib.mod interpolation.mod fmin_module.mod photoabsorption.mod
+ElasticFlux.o: ElasticFlux.f90 proton_A1_formfactors.inc alpha_running_poles.inc bessel_integration.o alpha_running.o OpticalGlauber_Geometry.o nintlib.o interpolation.o fmin_module.o
 	$(FC) $(FFLAGS) -c $<
 
-ElasticFlux.o ElasticFlux.mod: ElasticFlux.f90 proton_A1_formfactors.inc alpha_running_poles.inc bessel_integration.mod alpha_running.mod OpticalGlauber_Geometry.mod nintlib.mod interpolation.mod fmin_module.mod
+bessel_integration.o: bessel_integration.f90
 	$(FC) $(FFLAGS) -c $<
 
-bessel_integration.o bessel_integration.mod: bessel_integration.f90
+structure_functions.o: structure_functions.f90 clas_spline.inc interpolation.o ElasticFlux.o
 	$(FC) $(FFLAGS) -c $<
 
-structure_functions.o structure_functions.mod: structure_functions.f90 clas_spline.inc interpolation.mod ElasticFlux.mod
-	$(FC) $(FFLAGS) -c $<
-
-InelasticFlux.o inelasticflux.mod: InelasticFlux.f90 ElasticFlux.mod alpha_running.mod structure_functions.mod bessel_integration.mod interpolation.mod
+InelasticFlux.o: InelasticFlux.f90 ElasticFlux.o alpha_running.o structure_functions.o bessel_integration.o interpolation.o
 	$(FC) $(FFLAGS) -c $<
 
 lhapdf_stub.o: lhapdf_stub.f90
 	$(FC) $(FFLAGS) -c $<
 
-alpha_running.o alpha_running.mod: alpha_running.f90 nielsen_generalized_polylog.mod
+alpha_running.o: alpha_running.f90 nielsen_generalized_polylog.o
 	$(FC) $(FFLAGS) -c $<
 
-photoabsorption.o photoabsorption.mod: photoabsorption.f90
+photoabsorption.o: photoabsorption.f90
+	$(FC) $(FFLAGS) -c $<
+
+photonpdfsquare.o: photonpdfsquare.f PhotonPhotonFlux.o
 	$(FC) $(FFLAGS) -c $<
 
 tbessk.o: tbessk.f90
@@ -78,19 +90,19 @@ tbessj.o: tbessj.f90
 elliptic_integral.o: elliptic_integral.f90
 	$(FC) $(FFLAGS) -c $<
 
-nielsen_generalized_polylog.o nielsen_generalized_polylog.mod: nielsen_generalized_polylog.f90
+nielsen_generalized_polylog.o: nielsen_generalized_polylog.f90
 	$(FC) $(FFLAGS) -c $<
 
-interpolation.o interpolation.mod: interpolation.f90
+interpolation.o: interpolation.f90
 	$(FC) $(FFLAGS) -c $<
 
-fmin_module.o fmin_module.mod: fmin_module.f90
+fmin_module.o: fmin_module.f90
 	$(FC) $(FFLAGS) -c $<
 
-OpticalGlauber_Geometry.o OpticalGlauber_Geometry.mod: OpticalGlauber_Geometry.f90 nintlib.mod interpolation.mod nielsen_generalized_polylog.mod
+OpticalGlauber_Geometry.o: OpticalGlauber_Geometry.f90 nintlib.o interpolation.o nielsen_generalized_polylog.o
 	$(FC) $(FFLAGS) -c $<
 
-nintlib.o nintlib.mod: nintlib.f90
+nintlib.o: nintlib.f90
 	$(FC) $(FFLAGS) -c $<
 
 clean_all:
