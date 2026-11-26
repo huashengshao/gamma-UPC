@@ -10,6 +10,7 @@ c      if set to -1/-2 it meand that ipdg should not be flipped even if ih<0
 c      useful for re-weighting
 c***************************************************************************
       USE PhotonPhotonFlux
+      USE InelasticFlux, ONLY: inel_cache_dir
       implicit none
 c
 c     Arguments
@@ -142,11 +143,14 @@ c     The jobs of a run (SubProcesses/P*/G*/) share the photon-photon
 c     flux grids through files in the lib/ directory of the process:
 c     the first job builds each grid, the others read it. Off when the
 c     job does not run inside the process directory.
+c     The same folder holds the cache of the inelastic photon
+c     (inel_cache_dir: b-space rows, momentum-space transforms).
       if (.not.cache_set) then
          inquire(file='../../../Cards/run_card.dat',exist=lexist)
          if (lexist) then
             FFE_Grid_Cache=.true.
             FFE_Grid_Cache_Dir='../../../lib/'
+            inel_cache_dir='../../../lib/'
          endif
          cache_set=.true.
       endif

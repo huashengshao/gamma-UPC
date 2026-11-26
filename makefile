@@ -78,7 +78,7 @@ alpha_running.o: alpha_running.f90 nielsen_generalized_polylog.o
 photoabsorption.o: photoabsorption.f90
 	$(FC) $(FFLAGS) -c $<
 
-photonpdfsquare.o: photonpdfsquare.f PhotonPhotonFlux.o
+photonpdfsquare.o: photonpdfsquare.f PhotonPhotonFlux.o InelasticFlux.o
 	$(FC) $(FFLAGS) -c $<
 
 tbessk.o: tbessk.f90

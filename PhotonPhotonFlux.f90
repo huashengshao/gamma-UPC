@@ -4,7 +4,8 @@ MODULE PhotonPhotonFlux
   USE NINTLIB ! for multiple dimensional integrations
   USE interpolation
   USE InelasticFlux,ONLY:PhotonNumberDensity_inelastic_proton,PhotonFlux_proton_inelastic_nob,inel_fast_prepare_rows,&
-       inel_rhohat,elastic_rhohat,inel_rhohat_key,nucleus_rhohat
+       inel_rhohat,inel_rhohat_cached,elastic_rhohat,inel_rhohat_key,nucleus_rhohat,nucleus_rhohat_cached,&
+       elastic_rhohat_cached,vec_cache_get,vec_cache_put
   IMPLICIT NONE
   PRIVATE
   PUBLIC::alphaem_elasticphoton,alpha_running4photon,GENERATE_PROTON_FLUX_GRID
@@ -39,6 +40,8 @@ MODULE PhotonPhotonFlux
   LOGICAL,PUBLIC::pp_final_state_qspace=.TRUE.
   ! (M11) the photon-photon grid of pp states 1-3: nodes computed when first needed (the same values); (M15) also pA
   LOGICAL,PUBLIC::pp_grid_lazy=.TRUE.
+  ! (M16) the grids of states 1-3: 40 and 20 nodes per decade for x > 0.1 and 0.01 < x < 0.1 (.FALSE.: 10, as v2.0)
+  LOGICAL,PUBLIC::pp_grid_fine=.TRUE.
   INTEGER,PARAMETER,PRIVATE::QS_NQ=78,QS_NC1=12,QS_NC2=12,QS_NC=QS_NC1+QS_NC2,QS_MAXE=4096,QS_MAXI=16384
   REAL(KIND(1d0)),PARAMETER,PRIVATE::QS_LO=-13.815510557964274d0,QS_HI=0.47000362924573558d0 ! ln 1e-6, ln 1.6
   REAL(KIND(1d0)),PARAMETER,PRIVATE::QS_QM=0.05d0 ! the inelastic transforms: Chebyshev in ln q below, in q above
@@ -454,7 +457,10 @@ CONTAINS
        ENDIF
        log10xmin=INT(DLOG10(xmin))
        ! let us generate a 2-dim grid [xmin,1]x[xmin,1] first
-       MX=nseg*(-log10xmin)
+       MX=0 ! (M16) nseg nodes per decade; states 1-3 with pp_grid_fine: more in the two decades below x = 1 (nsegd)
+       DO I=0,log10xmin+1,-1
+          MX=MX+nsegd(I)
+       ENDDO
        MY=MX
        !IF(log10xmin.NE.log10xmin_before.or.init.EQ.0)THEN
        ! try to deallocate first
@@ -475,8 +481,8 @@ CONTAINS
        !ENDIF
        K=0
        DO I=0,log10xmin+1,-1
-          DO J=1,nseg
-             log10x1=-1d0/DBLE(nseg)*DBLE(J-1)+DBLE(I)
+          DO J=1,nsegd(I)
+             log10x1=-1d0/DBLE(nsegd(I))*DBLE(J-1)+DBLE(I)
              K=K+1
              XD_1D(K)=log10x1
              YD_1D(K)=log10x1
@@ -567,9 +573,8 @@ CONTAINS
           !   ENDDO
           !ENDDO
           !CALL lagrange_interp_2d(nseg,nseg,XD2_1D,YD2_1D,ZD2,1,XI,YI,ZI)
-          K=nseg*(-ilog10x1-1)
-          DO I=K+1,K+nseg+1
-             if(XD_1D(I).LE.XI(1))EXIT
+          DO I=1,MX_save+1 ! (M16) the first node <= log10 x1 (nodes decreasing; as the per-decade search before)
+             IF(XD_1D(I).LE.XI(1))EXIT
           ENDDO
           IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX_save+1)THEN
              K=I-n_interp/2-1
@@ -581,9 +586,8 @@ CONTAINS
              WRITE(*,*)"Error: you cannot reach here #1 !"
              STOP 1
           ENDIF
-          L=nseg*(-ilog10x2-1)
-          DO I=L+1,L+nseg+1
-             if(YD_1D(I).LE.YI(1))EXIT
+          DO I=1,MY_save+1
+             IF(YD_1D(I).LE.YI(1))EXIT
           ENDDO
           IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY_save+1)THEN
              L=I-n_interp/2-1
@@ -646,6 +650,16 @@ CONTAINS
     ENDIF
     RETURN
   CONTAINS
+    INTEGER FUNCTION nsegd(id)
+      ! (M16) nodes in the decade [id-1, id] of log10 x: nseg; states 1-3 with pp_grid_fine 40 (x > 0.1) and 20
+      ! (0.01 < x < 0.1), where the grid lookup error of the steep fall towards x -> 1 was 1e-4 to 1e-2 of dL/dW
+      INTEGER,INTENT(IN)::id
+      nsegd=nseg
+      IF(pp_grid_fine.AND.photon_final_state.NE.0)THEN
+         IF(id.EQ.0)nsegd=40
+         IF(id.EQ.-1)nsegd=20
+      ENDIF
+    END FUNCTION nsegd
     SUBROUTINE fill_block(K0,L0)
       ! (M11) the nodes of the stencil K0+1..K0+n_interp, L0+1..L0+n_interp not computed yet: the transforms (or the
       ! b-space rows) of their x and scales first, then PhotonPhotonFlux_pp_eval (the values the full grid has)
@@ -2017,7 +2031,10 @@ CONTAINS
        ENDIF
        log10xmin=INT(DLOG10(xmin))
        ! let us generate a 2-dim grid [xmin,1]x[xmin,1] first
-       MX=nseg*(-log10xmin)
+       MX=0 ! (M16) as PhotonPhotonFlux_pp: nsegd nodes per decade
+       DO I=0,log10xmin+1,-1
+          MX=MX+nsegd(I)
+       ENDDO
        MY=MX
        ! try to deallocate first
        IF(ALLOCATED(XD_1D))THEN
@@ -2034,8 +2051,8 @@ CONTAINS
        ALLOCATE(ZD(MX+1,MY+1))
        K=0
        DO I=0,log10xmin+1,-1
-          DO J=1,nseg
-             log10x1=-1d0/DBLE(nseg)*DBLE(J-1)+DBLE(I)
+          DO J=1,nsegd(I)
+             log10x1=-1d0/DBLE(nsegd(I))*DBLE(J-1)+DBLE(I)
              K=K+1
              XD_1D(K)=log10x1
              YD_1D(K)=log10x1
@@ -2116,9 +2133,8 @@ CONTAINS
           !   ENDDO
           !ENDDO
           !CALL lagrange_interp_2d(nseg,nseg,XD2_1D,YD2_1D,ZD2,1,XI,YI,ZI)
-          K=nseg*(-ilog10x1-1)
-          DO I=K+1,K+nseg+1
-             if(XD_1D(I).LE.XI(1))EXIT
+          DO I=1,MX_save+1 ! (M16) the first node <= log10 x1 (nodes decreasing)
+             IF(XD_1D(I).LE.XI(1))EXIT
           ENDDO
           IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MX_save+1)THEN
              K=I-n_interp/2-1
@@ -2130,9 +2146,8 @@ CONTAINS
              WRITE(*,*)"Error: you cannot reach here #1 !"
              STOP 1
           ENDIF
-          L=nseg*(-ilog10x2-1)
-          DO I=L+1,L+nseg+1
-             if(YD_1D(I).LE.YI(1))EXIT
+          DO I=1,MY_save+1
+             IF(YD_1D(I).LE.YI(1))EXIT
           ENDDO
           IF(I-n_interp/2.GE.1.AND.I-n_interp/2-1+n_interp.LE.MY_save+1)THEN
              L=I-n_interp/2-1
@@ -2193,6 +2208,14 @@ CONTAINS
     ENDIF
     RETURN
   CONTAINS
+    INTEGER FUNCTION nsegd(id) ! (M16) as in PhotonPhotonFlux_pp
+      INTEGER,INTENT(IN)::id
+      nsegd=nseg
+      IF(pp_grid_fine.AND.photon_final_state.NE.0)THEN
+         IF(id.EQ.0)nsegd=40
+         IF(id.EQ.-1)nsegd=20
+      ENDIF
+    END FUNCTION nsegd
     SUBROUTINE fill_block(K0,L0)
       ! (M15) as PhotonPhotonFlux_pp: the nodes of the stencil K0+1..K0+n_interp, L0+1..L0+n_interp not computed yet,
       ! the transforms (or the b-space rows) of their x and scales first
@@ -9170,7 +9193,7 @@ CONTAINS
     IF(qs_ne.GE.QS_MAXE)qs_ne=0 ! full: start again
     qs_ne=qs_ne+1
     qs_ex(qs_ne)=x
-    CALL elastic_rhohat(x,proton_FF_correction,QS_NQ,qs_q,qs_er(:,qs_ne))
+    CALL elastic_rhohat_cached(x,proton_FF_correction,QS_NQ,qs_q,qs_er(:,qs_ne))
     qs_el=qs_ne
   END FUNCTION qs_el
 
@@ -9186,16 +9209,18 @@ CONTAINS
     ENDDO
   END FUNCTION qs_in_find
 
-  SUBROUTINE qs_in_add(x,nmu,mu2v)
+  SUBROUTINE qs_in_add(x,nmu,mu2v,busy)
     ! (M11) the inelastic transforms at x and the scales mu2v that are not in the store
     IMPLICIT NONE
     REAL(KIND(1d0)),INTENT(IN)::x
     INTEGER,INTENT(IN)::nmu
     REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::mu2v
+    LOGICAL,INTENT(OUT),OPTIONAL::busy ! (M16) the row is being computed by another job (disk cache lock)
     REAL(KIND(1d0)),DIMENSION(nmu)::mm
     REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::R
     INTEGER::i,j,n
     LOGICAL::dup
+    IF(PRESENT(busy))busy=.FALSE.
     n=0
     DO i=1,nmu
        IF(qs_in_find(x,mu2v(i)).GT.0)CYCLE
@@ -9208,7 +9233,10 @@ CONTAINS
     ENDDO
     IF(n.EQ.0)RETURN
     ALLOCATE(R(QS_NC,n))
-    CALL inel_rhohat(x,QS_NC,qs_qc,n,mm(1:n),R)
+    CALL inel_rhohat_cached(x,QS_NC,qs_qc,n,mm(1:n),R,busy)
+    IF(PRESENT(busy))THEN
+       IF(busy)RETURN
+    ENDIF
     IF(qs_ni+n.GT.QS_MAXI)qs_ni=0 ! full: start again
     DO i=1,n
        qs_ni=qs_ni+1
@@ -9265,10 +9293,17 @@ CONTAINS
     REAL(KIND(1d0)),INTENT(IN)::mu2lo
     REAL(KIND(1d0)),DIMENSION(MAX(m1,m2))::mu2v
     REAL(KIND(1d0))::m2x
-    INTEGER::i,j,k
+    INTEGER::i,j,k,ipass
+    LOGICAL,DIMENSION(n1)::todo1
+    LOGICAL,DIMENSION(n2)::todo2
+    LOGICAL::busy
     CALL qspace_setup()
     CALL qspace_keys()
+    ! (M16) pass 1: the rows that no other job is computing (disk cache locks); pass 2: the others (waiting)
+    todo1=.TRUE.; todo2=.TRUE.
+    DO ipass=1,2
     DO i=1,n1
+       IF(.NOT.todo1(i))CYCLE
        IF(x1s(i).LE.0d0.OR.x1s(i).GE.1d0)CYCLE
        k=0
        DO j=1,m2
@@ -9277,10 +9312,14 @@ CONTAINS
           IF(m2x.LT.mu2lo)CYCLE
           k=k+1; mu2v(k)=m2x
        ENDDO
-       IF(k.GT.0)CALL qs_in_add(x1s(i),k,mu2v(1:k))
+       busy=.FALSE.
+       IF(k.GT.0.AND.ipass.EQ.1)CALL qs_in_add(x1s(i),k,mu2v(1:k),busy)
+       IF(k.GT.0.AND.ipass.EQ.2)CALL qs_in_add(x1s(i),k,mu2v(1:k))
+       todo1(i)=busy
        k=qs_el(x1s(i))
     ENDDO
     DO i=1,n2
+       IF(.NOT.todo2(i))CYCLE
        IF(x2s(i).LE.0d0.OR.x2s(i).GE.1d0)CYCLE
        k=0
        DO j=1,m1
@@ -9289,8 +9328,13 @@ CONTAINS
           IF(m2x.LT.mu2lo)CYCLE
           k=k+1; mu2v(k)=m2x
        ENDDO
-       IF(k.GT.0)CALL qs_in_add(x2s(i),k,mu2v(1:k))
+       busy=.FALSE.
+       IF(k.GT.0.AND.ipass.EQ.1)CALL qs_in_add(x2s(i),k,mu2v(1:k),busy)
+       IF(k.GT.0.AND.ipass.EQ.2)CALL qs_in_add(x2s(i),k,mu2v(1:k))
+       todo2(i)=busy
        k=qs_el(x2s(i))
+    ENDDO
+    IF(.NOT.(ANY(todo1).OR.ANY(todo2)))EXIT
     ENDDO
   END SUBROUTINE pp_qspace_prepare_grid
 
@@ -9414,10 +9458,14 @@ CONTAINS
     qa_cn=NINT(QA_CPD*DLOG10(QA_CXHI/QA_CXLO))+1; qa_ch=DLOG(QA_CXHI/QA_CXLO)/(qa_cn-1)
     IF(ALLOCATED(qa_ct))DEALLOCATE(qa_ct)
     ALLOCATE(qa_ct(qa_cn))
-    DO i=1,qa_cn
-       CALL nucleus_rhohat(QA_CXLO*DEXP((i-1)*qa_ch),R,wA,aA/GeVm12fm,1,(/0d0/),rc)
-       qa_ct(i)=DLOG(rc(1))
-    ENDDO
+    ! (M16) through the disk cache of inel_cache_dir (one file per nucleus and table)
+    IF(.NOT.vec_cache_get('nuct',(/1d0,R,wA,aA,QA_CXLO,QA_CXHI,DBLE(QA_CPD)/),qa_ct))THEN
+       DO i=1,qa_cn
+          CALL nucleus_rhohat(QA_CXLO*DEXP((i-1)*qa_ch),R,wA,aA/GeVm12fm,1,(/0d0/),rc)
+          qa_ct(i)=DLOG(rc(1))
+       ENDDO
+       CALL vec_cache_put('nuct',(/1d0,R,wA,aA,QA_CXLO,QA_CXHI,DBLE(QA_CPD)/),qa_ct)
+    ENDIF
   CONTAINS
     FUNCTION expm1_(y) ! exp(y)-1 without cancellation at small |y|
       REAL(KIND(1d0))::expm1_
@@ -9468,16 +9516,18 @@ CONTAINS
     ENDDO
   END FUNCTION qa_in_find
 
-  SUBROUTINE qa_in_add(x,nmu,mu2v)
+  SUBROUTINE qa_in_add(x,nmu,mu2v,busy)
     ! (M15) the inelastic transforms of pA (Chebyshev nodes qa_qc) at x and the scales mu2v not in the store
     IMPLICIT NONE
     REAL(KIND(1d0)),INTENT(IN)::x
     INTEGER,INTENT(IN)::nmu
     REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::mu2v
+    LOGICAL,INTENT(OUT),OPTIONAL::busy ! (M16) the row is being computed by another job (disk cache lock)
     REAL(KIND(1d0)),DIMENSION(nmu)::mm
     REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::R
     INTEGER::i,j,n
     LOGICAL::dup
+    IF(PRESENT(busy))busy=.FALSE.
     n=0
     DO i=1,nmu
        IF(qa_in_find(x,mu2v(i)).GT.0)CYCLE
@@ -9490,7 +9540,10 @@ CONTAINS
     ENDDO
     IF(n.EQ.0)RETURN
     ALLOCATE(R(QA_NC,n))
-    CALL inel_rhohat(x,QA_NC,qa_qc,n,mm(1:n),R)
+    CALL inel_rhohat_cached(x,QA_NC,qa_qc,n,mm(1:n),R,busy)
+    IF(PRESENT(busy))THEN
+       IF(busy)RETURN
+    ENDIF
     IF(qa_ni+n.GT.QA_MAXI)qa_ni=0 ! full: start again
     DO i=1,n
        qa_ni=qa_ni+1
@@ -9513,7 +9566,7 @@ CONTAINS
     IF(qa_ne.GE.QA_MAXE)qa_ne=0 ! full: start again
     qa_ne=qa_ne+1
     qa_ex(qa_ne)=x
-    CALL elastic_rhohat(x,proton_FF_correction,qa_nq+1,qa_q,qa_er(:,qa_ne))
+    CALL elastic_rhohat_cached(x,proton_FF_correction,qa_nq+1,qa_q,qa_er(:,qa_ne))
     qa_el=qa_ne
   END FUNCTION qa_el
 
@@ -9530,7 +9583,7 @@ CONTAINS
     IF(qa_nn.GE.QA_MAXN)qa_nn=0 ! full: start again
     qa_nn=qa_nn+1
     qa_nx(qa_nn)=x
-    CALL nucleus_rhohat(x,qa_key(1)/GeVm12fm,qa_key(2),qa_key(3)/GeVm12fm,qa_nq+1,qa_q,qa_nr(:,qa_nn))
+    CALL nucleus_rhohat_cached(x,qa_key(1)/GeVm12fm,qa_key(2),qa_key(3)/GeVm12fm,qa_nq+1,qa_q,qa_nr(:,qa_nn))
     qa_nuc=qa_nn
   END FUNCTION qa_nuc
 
@@ -9584,9 +9637,14 @@ CONTAINS
     REAL(KIND(1d0)),INTENT(IN)::mu2lo
     REAL(KIND(1d0)),DIMENSION(my)::mu2v
     REAL(KIND(1d0))::m2x
-    INTEGER::i,j,k
+    INTEGER::i,j,k,ipass
+    LOGICAL,DIMENSION(np)::todo
+    LOGICAL::busy
     CALL pA_qspace_keys()
+    todo=.TRUE. ! (M16) pass 1: the rows no other job is computing (disk cache locks); pass 2: the others
+    DO ipass=1,2
     DO i=1,np
+       IF(.NOT.todo(i))CYCLE
        IF(xps(i).LE.0d0.OR.xps(i).GE.1d0)CYCLE
        k=0
        DO j=1,my
@@ -9595,8 +9653,13 @@ CONTAINS
           IF(m2x.LT.mu2lo)CYCLE
           k=k+1; mu2v(k)=m2x
        ENDDO
-       IF(k.GT.0)CALL qa_in_add(xps(i),k,mu2v(1:k))
+       busy=.FALSE.
+       IF(k.GT.0.AND.ipass.EQ.1)CALL qa_in_add(xps(i),k,mu2v(1:k),busy)
+       IF(k.GT.0.AND.ipass.EQ.2)CALL qa_in_add(xps(i),k,mu2v(1:k))
+       todo(i)=busy
        k=qa_el(xps(i))
+    ENDDO
+    IF(.NOT.ANY(todo))EXIT
     ENDDO
     DO i=1,nA
        IF(xAs(i).LE.0d0.OR.xAs(i).GE.1d0)CYCLE

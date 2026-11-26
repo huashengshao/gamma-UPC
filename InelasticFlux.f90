@@ -37,17 +37,18 @@ MODULE InelasticFlux
   PUBLIC::inel_fast_prepare,inel_fast_prepare_rows
   ! two-dimensional Fourier transforms of the b-space densities (momentum space, the (1-P) parts of the final states of
   ! PhotonPhotonFlux)
-  PUBLIC::inel_rhohat,elastic_rhohat,inel_rhohat_key,nucleus_rhohat
+  PUBLIC::inel_rhohat,inel_rhohat_cached,elastic_rhohat,inel_rhohat_key,nucleus_rhohat
+  PUBLIC::nucleus_rhohat_cached,elastic_rhohat_cached,vec_cache_get,vec_cache_put ! (M16) disk cache (inel_cache_dir)
   LOGICAL,PARAMETER::rhohat_fast=.TRUE. ! rho_phat_fast in inel_rhohat (.FALSE.: rho_phat_mu, the reference)
   REAL(KIND(1d0)),PARAMETER::rhohat_kb2=30d0 ! (M12) bands of cuts rhohat_kb2 D <= kc < rhohat_kb D to O(D^2) (<= 1e-6)
   REAL(KIND(1d0)),PARAMETER::rhohat_kb=300d0 ! bands of cuts kc >= rhohat_kb D at leading order (<= 1.4e-6)
   REAL(KIND(1d0)),PARAMETER::rhohat_kf=3d0 ! cuts kc < rhohat_kf D by rho_phat_mu (coarse outer panels)
-  ! disk cache of the rows (fast_row_compute): directory (default '.', the working directory; '' disables). One file
+  ! disk cache of the rows (fast_row_compute): directory ('' (default): off; photonpdfsquare.f sets lib/). One file
   ! per computed block of a row, named by a hash of the settings (rho_model, low_Q2_model, alpha_running4photon,
   ! sf_pdf_id and its continuation thresholds, CACHE_VERSION), x and the b and mu2 lists; read back only if all of
   ! them agree exactly, written through a temporary file and a rename (safe for parallel jobs sharing the folder).
   ! inel_cache_hits, inel_cache_writes: blocks read from and written to the cache in this run
-  CHARACTER(LEN=512),PUBLIC::inel_cache_dir='.'
+  CHARACTER(LEN=512),PUBLIC::inel_cache_dir='' ! (M16) off by default as FFE_Grid_Cache; MadGraph: lib/
   INTEGER,PUBLIC::inel_cache_hits=0,inel_cache_writes=0
   INTEGER,PARAMETER::CACHE_VERSION=2 ! 2 (M15): rho_row without the Delta^2 interpolant, 6 Delta panels per decade
   LOGICAL::cache_warned=.FALSE.
@@ -183,6 +184,7 @@ CONTAINS
     REAL(KIND(1d0)),PARAMETER::v0=-16.1180955509583157d0 ! ln(CXMIN/(1-CXMIN))
     REAL(KIND(1d0))::kc2,v,t,wv(6),wt(6),mu2v(NCT),row(NCT),xi,ps(-KC:KC,NCT),z(6,6)
     INTEGER::i0,j0,i,j,key,na(NCT),ns,k
+    REAL(KIND(1d0))::cfk(11),cv(NCT*(2*KC+2))
     coll_grid=.FALSE.; F=0d0
     IF(.NOT.GENERATE_PROTON_FLUX_GRID.OR.mu2.GE.HUGE(1d0).OR.x.LT.CXMIN.OR.x.GT.CXMAX)RETURN
     kc2=mu2-x**2*mp2
@@ -202,7 +204,15 @@ CONTAINS
           mu2v(j)=DEXP(2d0*DLOG(CKMIN)+(j-1)*CTH)+xi**2*mp2
        ENDDO
        IF(.NOT.ALLOCATED(cps))ALLOCATE(cnact(NCT,NCV),cps(-KC:KC,NCT,NCV))
-       CALL coll_row(xi,NCT,mu2v,row,na,ps)
+       ! (M16) the row through the disk cache of inel_cache_dir (stored as computed: the same values)
+       cfk=(/1d0,xi,DBLE(key),DBLE(sf_pdf_id),sf_xc,MIN(sf_Q2c,1d300),DBLE(NCT),DBLE(KC),CKMIN,CTH,mp2/)
+       IF(vec_cache_get('coll',cfk,cv))THEN
+          na=NINT(cv(1:NCT)); ps=RESHAPE(cv(NCT+1:),(/2*KC+1,NCT/))
+       ELSE
+          CALL coll_row(xi,NCT,mu2v,row,na,ps)
+          cv(1:NCT)=DBLE(na); cv(NCT+1:)=RESHAPE(ps,(/(2*KC+1)*NCT/))
+          CALL vec_cache_put('coll',cfk,cv)
+       ENDIF
        cnact(:,i)=na
        cps(:,:,i)=-HUGE(1d0)
        WHERE(ps.GT.0d0)cps(:,:,i)=DLOG(ps)
@@ -2057,6 +2067,268 @@ CONTAINS
        IF(ALLOCATED(G2))DEALLOCATE(e2,G2)
     ENDDO
   END SUBROUTINE inel_rhohat
+
+
+  SUBROUTINE inel_rhohat_cached(x,nq,qv,nmu,mu2v,R,busy)
+    ! (M16) inel_rhohat through the disk cache of inel_cache_dir ('' disables it): one file per x and q node set,
+    ! gammaUPC_rhat_<hash>.bin, holding every scale computed so far (by any process); the scales not in the file are
+    ! computed and the merged file written through a temporary file and a rename (a concurrent write may drop
+    ! scales, which are then computed again: never a wrong value). The values read are those written (bit for bit).
+    ! A job computing a file holds <file>.lock (stale after LOCK_STALE s): another job waits for it and reads the
+    ! file, or, with busy present, returns busy = .TRUE. at once (R undefined) to compute other rows first
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::nq,nmu
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(IN)::qv
+    REAL(KIND(1d0)),DIMENSION(nmu),INTENT(IN)::mu2v
+    REAL(KIND(1d0)),DIMENSION(nq,nmu),INTENT(OUT)::R
+    LOGICAL,INTENT(OUT),OPTIONAL::busy
+    INTEGER,PARAMETER::LOCK_STALE=120
+    LOGICAL::locked
+    INTEGER,PARAMETER::RHAT_VERSION=1,ENDMARK=20261125
+    INTEGER,DIMENSION(7)::hi,fi
+    REAL(KIND(1d0)),DIMENSION(3)::hr,fr
+    REAL(KIND(1d0)),DIMENSION(:),ALLOCATABLE::fm,am,fq
+    REAL(KIND(1d0)),DIMENSION(:,:),ALLOCATABLE::Rf,Ra,Rn
+    REAL(KIND(1d0)),DIMENSION(nmu)::mm
+    LOGICAL,DIMENSION(nmu)::got
+    CHARACTER(LEN=600)::fname
+    CHARACTER(LEN=640)::tmp
+    CHARACTER(LEN=12)::pid
+    CHARACTER(LEN=8)::magic
+    INTEGER::u,ios,nf,i,j,n,em
+    IF(PRESENT(busy))busy=.FALSE.
+    IF(LEN_TRIM(inel_cache_dir).EQ.0)THEN
+       CALL inel_rhohat(x,nq,qv,nmu,mu2v,R)
+       RETURN
+    ENDIF
+    CALL inel_init()
+    hi=(/RHAT_VERSION,rho_model,low_Q2_model,MERGE(1,0,alpha_running4photon),sf_pdf_id,nq,tab_version/)
+    hr=(/sf_xc,MIN(sf_Q2c,1d300),x/)
+    fname=TRIM(inel_cache_dir)//'/gammaUPC_rhat_'//cache_hash(hi,hr,qv,(/0d0/))//'.bin'
+    locked=.FALSE.
+    DO ! (read; if scales are missing: lock, or wait for the job holding the lock and read again)
+    nf=0
+    IF(ALLOCATED(fm))DEALLOCATE(fq,fm,Rf)
+    OPEN(NEWUNIT=u,FILE=TRIM(fname),ACCESS='STREAM',FORM='UNFORMATTED',STATUS='OLD',ACTION='READ',IOSTAT=ios)
+    IF(ios.EQ.0)THEN
+       READ(u,IOSTAT=ios)magic,fi,fr,nf
+       IF(ios.NE.0.OR.magic.NE.'GUPCRHAT'.OR.ANY(fi.NE.hi).OR.ANY(fr.NE.hr).OR.nf.LT.0.OR.nf.GT.10000000)nf=-1
+       IF(nf.GT.0)THEN
+          ALLOCATE(fq(nq),fm(nf),Rf(nq,nf))
+          READ(u,IOSTAT=ios)fq,fm,Rf,em
+          IF(ios.NE.0.OR.em.NE.ENDMARK.OR.ANY(fq.NE.qv))nf=-1
+       ENDIF
+       CLOSE(u)
+    ENDIF
+    IF(nf.LT.0)THEN
+       nf=0
+       IF(ALLOCATED(fm))DEALLOCATE(fq,fm,Rf)
+    ENDIF
+    got=.FALSE.
+    DO i=1,nmu
+       DO j=nf,1,-1
+          IF(fm(j).EQ.mu2v(i))THEN
+             R(:,i)=Rf(:,j); got(i)=.TRUE.; EXIT
+          ENDIF
+       ENDDO
+    ENDDO
+    IF(ALL(got))THEN
+       !$OMP ATOMIC
+       inel_cache_hits=inel_cache_hits+1
+       IF(locked)CALL lock_release(fname)
+       RETURN
+    ENDIF
+    IF(locked)EXIT
+    IF(lock_take(fname,LOCK_STALE))THEN
+       locked=.TRUE. ! read again: the holder may have just finished
+       CYCLE
+    ENDIF
+    IF(PRESENT(busy))THEN
+       busy=.TRUE.; RETURN
+    ENDIF
+    CALL SLEEP(1)
+    ENDDO
+    n=0 ! the missing scales, each once
+    DO i=1,nmu
+       IF(got(i))CYCLE
+       IF(ANY(mm(1:n).EQ.mu2v(i)))CYCLE
+       n=n+1; mm(n)=mu2v(i)
+    ENDDO
+    ALLOCATE(Rn(nq,n))
+    CALL inel_rhohat(x,nq,qv,n,mm(1:n),Rn)
+    DO i=1,nmu
+       IF(got(i))CYCLE
+       DO j=1,n
+          IF(mm(j).EQ.mu2v(i))THEN
+             R(:,i)=Rn(:,j); EXIT
+          ENDIF
+       ENDDO
+    ENDDO
+    ALLOCATE(am(nf+n),Ra(nq,nf+n)) ! the merged file
+    IF(nf.GT.0)THEN
+       am(1:nf)=fm; Ra(:,1:nf)=Rf
+    ENDIF
+    am(nf+1:nf+n)=mm(1:n); Ra(:,nf+1:nf+n)=Rn
+    WRITE(pid,'(I12)')GETPID()
+    tmp=TRIM(fname)//'.'//TRIM(ADJUSTL(pid))//'.tmp'
+    OPEN(NEWUNIT=u,FILE=TRIM(tmp),ACCESS='STREAM',FORM='UNFORMATTED',STATUS='REPLACE',ACTION='WRITE',IOSTAT=ios)
+    IF(ios.EQ.0)THEN
+       WRITE(u,IOSTAT=ios)'GUPCRHAT',hi,hr,nf+n,qv,am,Ra,ENDMARK
+       CLOSE(u)
+    ENDIF
+    IF(ios.EQ.0)CALL RENAME(TRIM(tmp),TRIM(fname),ios)
+    IF(ios.EQ.0)THEN
+       !$OMP ATOMIC
+       inel_cache_writes=inel_cache_writes+1
+    ELSEIF(.NOT.cache_warned)THEN
+       !$OMP CRITICAL(inel_cache_warning)
+       IF(.NOT.cache_warned)WRITE(*,*)"WARNING: InelasticFlux: cannot write the transform cache in ",&
+            TRIM(inel_cache_dir)," (inel_cache_dir; '' disables it)"
+       cache_warned=.TRUE.
+       !$OMP END CRITICAL(inel_cache_warning)
+    ENDIF
+    CALL lock_release(fname)
+  END SUBROUTINE inel_rhohat_cached
+
+  LOGICAL FUNCTION lock_take(fname,stale)
+    ! (M16) creates <fname>.lock (exclusive) with the time; a lock older than stale seconds is removed first;
+    ! .TRUE. also when the folder is not writable (no lock: the job computes, as without cache)
+    IMPLICIT NONE
+    CHARACTER(LEN=*),INTENT(IN)::fname
+    INTEGER,INTENT(IN)::stale
+    INTEGER::u,ios
+    INTEGER(KIND=8)::t
+    LOGICAL::ex
+    OPEN(NEWUNIT=u,FILE=TRIM(fname)//'.lock',STATUS='NEW',ACTION='WRITE',IOSTAT=ios)
+    IF(ios.EQ.0)THEN
+       WRITE(u,*)epoch_s()
+       CLOSE(u)
+       lock_take=.TRUE.
+       RETURN
+    ENDIF
+    INQUIRE(FILE=TRIM(fname)//'.lock',EXIST=ex)
+    IF(.NOT.ex)THEN
+       lock_take=.TRUE. ! not writable
+       RETURN
+    ENDIF
+    lock_take=.FALSE.
+    t=-1
+    OPEN(NEWUNIT=u,FILE=TRIM(fname)//'.lock',STATUS='OLD',ACTION='READ',IOSTAT=ios)
+    IF(ios.EQ.0)THEN
+       READ(u,*,IOSTAT=ios)t
+       CLOSE(u)
+    ENDIF
+    IF(t.GE.0.AND.epoch_s()-t.GT.stale)CALL lock_release(fname) ! stale: taken at the next attempt
+  END FUNCTION lock_take
+
+  SUBROUTINE lock_release(fname)
+    IMPLICIT NONE
+    CHARACTER(LEN=*),INTENT(IN)::fname
+    INTEGER::u,ios
+    OPEN(NEWUNIT=u,FILE=TRIM(fname)//'.lock',STATUS='OLD',IOSTAT=ios)
+    IF(ios.EQ.0)CLOSE(u,STATUS='DELETE')
+  END SUBROUTINE lock_release
+
+  INTEGER(KIND=8) FUNCTION epoch_s()
+    ! seconds since 1970 (UTC offset ignored: only differences matter)
+    IMPLICIT NONE
+    INTEGER,DIMENSION(8)::v
+    INTEGER(KIND=8)::y,m,jd
+    CALL DATE_AND_TIME(VALUES=v)
+    y=v(1); m=v(2)
+    jd=v(3)-32075_8+1461_8*(y+4800_8+(m-14_8)/12_8)/4_8+367_8*(m-2_8-(m-14_8)/12_8*12_8)/12_8&
+         -3_8*((y+4900_8+(m-14_8)/12_8)/100_8)/4_8
+    epoch_s=(jd-2440588_8)*86400_8+v(5)*3600_8+v(6)*60_8+v(7)
+  END FUNCTION epoch_s
+
+
+  LOGICAL FUNCTION vec_cache_get(tag,key,v)
+    ! (M16) the vector v stored in inel_cache_dir under tag and key (every element of key and the size of v must
+    ! agree exactly); .FALSE. (v untouched) if the cache is off, the file is missing or does not match
+    IMPLICIT NONE
+    CHARACTER(LEN=*),INTENT(IN)::tag
+    REAL(KIND(1d0)),DIMENSION(:),INTENT(IN)::key
+    REAL(KIND(1d0)),DIMENSION(:),INTENT(INOUT)::v
+    REAL(KIND(1d0)),DIMENSION(SIZE(key))::fk
+    REAL(KIND(1d0)),DIMENSION(SIZE(v))::fv
+    CHARACTER(LEN=8)::magic
+    INTEGER::u,ios,nk,nv,em
+    vec_cache_get=.FALSE.
+    IF(LEN_TRIM(inel_cache_dir).EQ.0)RETURN
+    OPEN(NEWUNIT=u,FILE=TRIM(vec_cache_file(tag,key)),ACCESS='STREAM',FORM='UNFORMATTED',STATUS='OLD',&
+         ACTION='READ',IOSTAT=ios)
+    IF(ios.NE.0)RETURN
+    READ(u,IOSTAT=ios)magic,nk,nv
+    IF(ios.EQ.0.AND.magic.EQ.'GUPCVEC1'.AND.nk.EQ.SIZE(key).AND.nv.EQ.SIZE(v))THEN
+       READ(u,IOSTAT=ios)fk,fv,em
+       IF(ios.EQ.0.AND.em.EQ.20261125.AND.ALL(fk.EQ.key))THEN
+          v=fv; vec_cache_get=.TRUE.
+          !$OMP ATOMIC
+          inel_cache_hits=inel_cache_hits+1
+       ENDIF
+    ENDIF
+    CLOSE(u)
+  END FUNCTION vec_cache_get
+
+  SUBROUTINE vec_cache_put(tag,key,v)
+    ! (M16) stores v under tag and key in inel_cache_dir (temporary file and rename; nothing if the cache is off)
+    IMPLICIT NONE
+    CHARACTER(LEN=*),INTENT(IN)::tag
+    REAL(KIND(1d0)),DIMENSION(:),INTENT(IN)::key,v
+    CHARACTER(LEN=640)::tmp
+    CHARACTER(LEN=12)::pid
+    INTEGER::u,ios
+    IF(LEN_TRIM(inel_cache_dir).EQ.0)RETURN
+    WRITE(pid,'(I12)')GETPID()
+    tmp=TRIM(vec_cache_file(tag,key))//'.'//TRIM(ADJUSTL(pid))//'.tmp'
+    OPEN(NEWUNIT=u,FILE=TRIM(tmp),ACCESS='STREAM',FORM='UNFORMATTED',STATUS='REPLACE',ACTION='WRITE',IOSTAT=ios)
+    IF(ios.EQ.0)THEN
+       WRITE(u,IOSTAT=ios)'GUPCVEC1',SIZE(key),SIZE(v),key,v,20261125
+       CLOSE(u)
+    ENDIF
+    IF(ios.EQ.0)CALL RENAME(TRIM(tmp),TRIM(vec_cache_file(tag,key)),ios)
+    IF(ios.EQ.0)THEN
+       !$OMP ATOMIC
+       inel_cache_writes=inel_cache_writes+1
+    ENDIF
+  END SUBROUTINE vec_cache_put
+
+  FUNCTION vec_cache_file(tag,key)
+    IMPLICIT NONE
+    CHARACTER(LEN=600)::vec_cache_file
+    CHARACTER(LEN=*),INTENT(IN)::tag
+    REAL(KIND(1d0)),DIMENSION(:),INTENT(IN)::key
+    vec_cache_file=TRIM(inel_cache_dir)//'/gammaUPC_'//TRIM(tag)//'_'//cache_hash((/0/),key,(/0d0/),(/0d0/))//'.bin'
+  END FUNCTION vec_cache_file
+
+  SUBROUTINE nucleus_rhohat_cached(x,RR,w,aa,nq,qv,R)
+    ! (M16) nucleus_rhohat through the disk cache of inel_cache_dir (one file per nucleus, x and q node set)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x,RR,w,aa
+    INTEGER,INTENT(IN)::nq
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(IN)::qv
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(OUT)::R
+    REAL(KIND(1d0)),DIMENSION(5+nq)::key
+    key(1:5)=(/1d0,x,RR,w,aa/); key(6:)=qv
+    IF(vec_cache_get('nucq',key,R))RETURN
+    CALL nucleus_rhohat(x,RR,w,aa,nq,qv,R)
+    CALL vec_cache_put('nucq',key,R)
+  END SUBROUTINE nucleus_rhohat_cached
+
+  SUBROUTINE elastic_rhohat_cached(x,iFF,nq,qv,R)
+    ! (M16) elastic_rhohat through the disk cache of inel_cache_dir (one file per x, form factor and q node set)
+    IMPLICIT NONE
+    REAL(KIND(1d0)),INTENT(IN)::x
+    INTEGER,INTENT(IN)::iFF,nq
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(IN)::qv
+    REAL(KIND(1d0)),DIMENSION(nq),INTENT(OUT)::R
+    REAL(KIND(1d0)),DIMENSION(4+nq)::key
+    key(1:4)=(/1d0,x,DBLE(iFF),MERGE(1d0,0d0,alpha_running4photon)/); key(5:)=qv
+    IF(vec_cache_get('elq',key,R))RETURN
+    CALL elastic_rhohat(x,iFF,nq,qv,R)
+    CALL vec_cache_put('elq',key,R)
+  END SUBROUTINE elastic_rhohat_cached
 
 
   SUBROUTINE rho_phat_fast(nmu,kcv,hi0,Anode,nD,Dv,e,np,G,Ph)
